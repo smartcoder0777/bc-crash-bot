@@ -1,5 +1,5 @@
 {
-  "base_stake": 0.01,
+  "base_stake": 0.1,
   "cashout": 1.45,
   "loss_multiplier": 3.15,
   "losses_before_rest": 4,

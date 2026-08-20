@@ -133,15 +133,19 @@ class StrategyEngine:
         self.state.rest_remaining = max(0, self.state.rest_remaining - 1)
         self.state.message = f"Resting… {self.state.rest_remaining} rounds left"
         if self.state.rest_remaining == 0:
+            attempts = int(self.config.recovery_attempts)
+            if attempts <= 0:
+                self._stop("Rest done — recovery attempts is 0, bot stopped")
+                return
             self.state.mode = Mode.RECOVERY
             self.state.recovery_stake = round(
                 self.state.last_lost_amount * self.config.loss_multiplier, 8
             )
-            self.state.recovery_left = self.config.recovery_attempts
+            self.state.recovery_left = attempts
             self.state.current_stake = self.state.recovery_stake
             self.state.message = (
-                f"Recovery: bet {self.state.recovery_stake} "
-                f"×{self.config.recovery_attempts} @ {self.config.cashout}x"
+                f"Recovery ready: bet {self.state.recovery_stake} "
+                f"×{attempts} @ {self.config.cashout}x"
             )
 
     def on_bet_result(self, won: bool, stake: float, crash_at: float | None = None) -> None:

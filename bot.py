@@ -351,13 +351,48 @@ class CrashBot:
                                 "Watching rounds (betting OFF). Click Start bet to play."
                             )
                         elif self.engine.state.mode == Mode.RESTING:
+                            # Count this round as rest (no bet)
                             self.engine.on_round_skipped()
                             self.site_message = self.engine.state.message
                             pending_bet = None
+                            # Rest finished on this tick → place first recovery on NEXT round
+                            # (message already says Recovery ready)
+                        elif self.engine.state.mode == Mode.RECOVERY:
+                            pending_bet = self.engine.next_bet()
+                            if pending_bet:
+                                bal = await self._read_balance(page)
+                                stake = pending_bet["stake"]
+                                if bal is not None and stake > bal + 1e-9:
+                                    # Stop betting only — keep browser connected
+                                    self.engine.state.message = (
+                                        f"Recovery blocked: need {stake}, balance {bal}. "
+                                        f"Betting stopped — deposit or lower B, then Start bet."
+                                    )
+                                    self.site_message = self.engine.state.message
+                                    self.betting_enabled = False
+                                    pending_bet = None
+                                    self._emit()
+                                else:
+                                    ok = await self._place_bet(
+                                        page, stake, pending_bet["cashout"]
+                                    )
+                                    if ok:
+                                        self.site_message = (
+                                            f"RECOVERY bet {stake} "
+                                            f"@ {pending_bet['cashout']}x "
+                                            f"({self.engine.state.recovery_left} left)"
+                                        )
+                                    else:
+                                        self.site_message = (
+                                            "Recovery bet fill failed — will retry next round"
+                                        )
+                                        pending_bet = None
+                            else:
+                                self.site_message = self.engine.state.message
+                                pending_bet = None
                         else:
                             pending_bet = self.engine.next_bet()
                             if pending_bet:
-                                # Never all-in: skip if stake exceeds wallet
                                 bal = await self._read_balance(page)
                                 if bal is not None and pending_bet["stake"] > bal + 1e-9:
                                     self.site_message = (
@@ -382,6 +417,7 @@ class CrashBot:
                                         pending_bet = None
                             else:
                                 self.site_message = self.engine.state.message
+                                pending_bet = None
 
                     if phase == "crashed" and last_phase not in ("crashed", "unknown"):
                         if pending_bet is not None:
