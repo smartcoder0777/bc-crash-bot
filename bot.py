@@ -357,34 +357,56 @@ class CrashBot:
                         else:
                             pending_bet = self.engine.next_bet()
                             if pending_bet:
-                                ok = await self._place_bet(
-                                    page, pending_bet["stake"], pending_bet["cashout"]
-                                )
-                                if ok:
+                                # Never all-in: skip if stake exceeds wallet
+                                bal = await self._read_balance(page)
+                                if bal is not None and pending_bet["stake"] > bal + 1e-9:
                                     self.site_message = (
-                                        f"Placed bet {pending_bet['stake']} "
-                                        f"@ {pending_bet['cashout']}x"
-                                    )
-                                else:
-                                    self.site_message = (
-                                        "Could not fill/click bet — check selectors / UI"
+                                        f"Skip bet: stake {pending_bet['stake']} > balance {bal}"
                                     )
                                     pending_bet = None
+                                else:
+                                    ok = await self._place_bet(
+                                        page,
+                                        pending_bet["stake"],
+                                        pending_bet["cashout"],
+                                    )
+                                    if ok:
+                                        self.site_message = (
+                                            f"Placed bet {pending_bet['stake']} "
+                                            f"@ {pending_bet['cashout']}x"
+                                        )
+                                    else:
+                                        self.site_message = (
+                                            "Could not fill/click bet — check selectors / UI"
+                                        )
+                                        pending_bet = None
                             else:
                                 self.site_message = self.engine.state.message
 
                     if phase == "crashed" and last_phase not in ("crashed", "unknown"):
                         if pending_bet is not None:
                             cashout = pending_bet["cashout"]
-                            crash_at = mult if mult and mult >= 1.0 else None
-                            won = crash_at is not None and crash_at >= cashout
-                            hint = await self._result_hint(page)
-                            if hint is not None:
-                                won = hint
-                            self.engine.on_bet_result(
-                                won=won, stake=pending_bet["stake"], crash_at=crash_at
+                            # Real crash from history strip — NOT cashout (1.45) marker
+                            await asyncio.sleep(0.45)
+                            crash_at = await self._read_latest_history_crash(page)
+                            if crash_at is None:
+                                crash_at = await self._read_crashed_at_text(page)
+                            if crash_at is None and mult and mult > cashout + 0.05:
+                                # live mult only if clearly above cashout (avoid 1.45 UI ghost)
+                                crash_at = mult
+                            won = (
+                                crash_at is not None and crash_at + 1e-9 >= cashout
                             )
-                            self.site_message = self.engine.state.message
+                            self.engine.on_bet_result(
+                                won=won,
+                                stake=pending_bet["stake"],
+                                crash_at=crash_at,
+                            )
+                            self.site_message = (
+                                f"{'Win' if won else 'Lose'} @ crash "
+                                f"{crash_at if crash_at is not None else '?'}x "
+                                f"(cashout {cashout}x) | {self.engine.state.message}"
+                            )
                             pending_bet = None
 
                     last_phase = phase
@@ -438,35 +460,73 @@ class CrashBot:
             self.site_message = "Skipped bet fill — sign-in is open"
             return False
 
-        selectors = self.config.get("selectors", {})
-        amount_loc = await self._first_locator(page, selectors.get("bet_amount", []))
-        cash_loc = await self._first_locator(page, selectors.get("cashout", []))
-        btn_loc = await self._first_locator(page, selectors.get("bet_button", []))
+        # Ensure Manual tab if present
+        try:
+            manual = page.get_by_role("tab", name=re.compile(r"^Manual$", re.I))
+            if await manual.count() and await manual.first.is_visible():
+                await manual.first.click()
+                await asyncio.sleep(0.15)
+        except Exception:  # noqa: BLE001
+            pass
 
-        # BC.Game Manual panel labels
+        amount_loc = await self._input_near_label(page, r"^Amount")
         if amount_loc is None:
-            amount_loc = await self._input_near_label(page, r"Amount")
+            amount_loc = await self._first_locator(
+                page, self.config.get("selectors", {}).get("bet_amount", [])
+            )
+        cash_loc = await self._input_near_label(page, r"Auto cash out")
         if cash_loc is None:
-            cash_loc = await self._input_near_label(page, r"Auto cash out|Cash ?out")
-        if btn_loc is None:
-            try:
-                btn = page.get_by_role("button", name=re.compile(r"^Bet$", re.I))
+            cash_loc = await self._first_locator(
+                page, self.config.get("selectors", {}).get("cashout", [])
+            )
+
+        # Only the main bet button — never 2x / 10 / quick chips
+        btn_loc = None
+        try:
+            for pattern in (r"^Bet$", r"^Main Bet", r"Bet \(Next Round\)"):
+                btn = page.get_by_role("button", name=re.compile(pattern, re.I))
                 if await btn.count() and await btn.first.is_visible():
                     btn_loc = btn.first
-            except Exception:  # noqa: BLE001
-                pass
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        if btn_loc is None:
+            btn_loc = await self._first_locator(
+                page, ["button:has-text('Main Bet')", "button:has-text('Bet')"]
+            )
 
         if amount_loc is None or btn_loc is None:
             return False
 
         try:
+            stake_txt = self._fmt(stake)
+            cash_txt = self._fmt(cashout)
+
             await amount_loc.click()
             await amount_loc.fill("")
-            await amount_loc.fill(self._fmt(stake))
+            await amount_loc.press("Control+A")
+            await amount_loc.fill(stake_txt)
+            await asyncio.sleep(0.1)
+
+            # Verify amount — abort if site clamped to all-in / wrong value
+            try:
+                shown = await amount_loc.input_value()
+                shown_val = float(re.sub(r"[^\d.]", "", shown) or "nan")
+                if shown_val == shown_val:  # not NaN
+                    if abs(shown_val - stake) > max(0.0001, stake * 0.05):
+                        self.site_message = (
+                            f"Amount mismatch: wanted {stake}, field shows {shown_val} — aborted"
+                        )
+                        return False
+            except Exception:  # noqa: BLE001
+                pass
+
             if cash_loc is not None:
                 await cash_loc.click()
                 await cash_loc.fill("")
-                await cash_loc.fill(self._fmt(cashout))
+                await cash_loc.press("Control+A")
+                await cash_loc.fill(cash_txt)
+
             await btn_loc.click()
             return True
         except Exception as exc:  # noqa: BLE001
@@ -478,14 +538,64 @@ class CrashBot:
             label = page.get_by_text(re.compile(label_re, re.I)).first
             if await label.count() == 0:
                 return None
-            root = label.locator(
-                "xpath=ancestor::*[.//input][1]"
-            )
+            root = label.locator("xpath=ancestor::*[.//input][1]")
             inp = root.locator("input").first
             if await inp.count() and await inp.is_visible():
                 return inp
         except Exception:  # noqa: BLE001
             return None
+        return None
+
+    async def _read_latest_history_crash(self, page) -> float | None:
+        """Read newest crash from the top history chips (e.g. 40.94x), not cashout 1.45."""
+        try:
+            val = await page.evaluate(
+                """() => {
+                  const chips = [];
+                  for (const el of document.querySelectorAll('div, span, a, button')) {
+                    if (el.offsetParent === null) continue;
+                    const t = (el.innerText || '').trim();
+                    if (!/^\\d+(\\.\\d+)?x$/i.test(t)) continue;
+                    if (t.length > 12) continue;
+                    const r = el.getBoundingClientRect();
+                    // History strip is near the top of the game panel
+                    if (r.top < 40 || r.top > 280 || r.width < 8) continue;
+                    const v = parseFloat(t);
+                    if (v >= 1) chips.push({ v, left: r.left, top: r.top });
+                  }
+                  if (!chips.length) return null;
+                  // Prefer the top-most row; newest is usually left-most on BC.Game
+                  chips.sort((a, b) => a.top - b.top || a.left - b.left);
+                  const topY = chips[0].top;
+                  const row = chips.filter((c) => Math.abs(c.top - topY) < 20);
+                  row.sort((a, b) => a.left - b.left);
+                  return row[0].v;
+                }"""
+            )
+            if isinstance(val, (int, float)) and val >= 1:
+                return float(val)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    async def _read_crashed_at_text(self, page) -> float | None:
+        try:
+            text = await page.locator("body").inner_text()
+            m = re.search(
+                r"(?:crashed|bust)[^\d]{0,12}(\d+\.?\d*)\s*x",
+                text,
+                flags=re.I,
+            )
+            if m:
+                return float(m.group(1))
+            # Big center crash number sometimes shown alone
+            m2 = re.search(r"\b(\d+\.\d{2})\s*x\b", text)
+            if m2:
+                v = float(m2.group(1))
+                # Ignore the cashout setting if that's all we found
+                return v
+        except Exception:  # noqa: BLE001
+            pass
         return None
 
     @staticmethod
@@ -591,26 +701,29 @@ class CrashBot:
             return None
 
     async def _read_multiplier(self, page) -> float | None:
-        selectors = self.config.get("selectors", {}).get("multiplier", [])
-        for sel in selectors:
-            loc = page.locator(sel).first
-            try:
-                if await loc.count() == 0:
-                    continue
-                text = (await loc.inner_text()).strip()
-                m = re.search(r"(\d+\.?\d*)", text.replace(",", ""))
-                if m:
-                    return float(m.group(1))
-            except Exception:  # noqa: BLE001
-                continue
-
+        """Live flying multiplier only — ignore cashout field (1.45) and history chips."""
         try:
-            body = await page.locator("body").inner_text()
-            matches = re.findall(r"(\d+\.\d{2})\s*x", body, flags=re.I)
-            if matches:
-                vals = [float(x) for x in matches if 1.0 <= float(x) <= 100000]
-                if vals:
-                    return max(vals) if len(vals) < 5 else vals[0]
+            val = await page.evaluate(
+                """() => {
+                  const nodes = Array.from(document.querySelectorAll('div, span'));
+                  let best = null;
+                  for (const el of nodes) {
+                    if (el.offsetParent === null) continue;
+                    const t = (el.innerText || '').trim();
+                    if (!/^\\d+\\.\\d{2}x$/i.test(t)) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 40 || r.height < 20) continue;
+                    if (r.top < 120) continue;
+                    const v = parseFloat(t);
+                    if (v < 1) continue;
+                    const area = r.width * r.height;
+                    if (!best || area > best.area) best = { v, area };
+                  }
+                  return best ? best.v : null;
+                }"""
+            )
+            if isinstance(val, (int, float)) and val >= 1:
+                return float(val)
         except Exception:  # noqa: BLE001
             pass
         return None

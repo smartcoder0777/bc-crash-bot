@@ -6,7 +6,7 @@
   "rest_rounds": 10,
   "recovery_attempts": 2,
   "stop_loss": 50.0,
-  "start_balance": 0.01,
+  "start_balance": 0.22,
   "site_url": "https://bcmail2.com/game/crash",
   "headless": false,
   "selectors": {
