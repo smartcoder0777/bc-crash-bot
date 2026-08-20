@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from strategy import Mode, StrategyEngine
+from network_feed import CrashNetworkFeed
 
 ROOT = Path(__file__).resolve().parent
 PROFILE_DIR = ROOT / "browser_data"
@@ -63,6 +64,7 @@ class CrashBot:
         self.awaiting_login = False
         self.betting_enabled = False
         self._refresh_balance = False
+        self._feed = CrashNetworkFeed()
         self.live_multiplier: float | None = None
         self.site_message = "Browser not started"
 
@@ -80,6 +82,7 @@ class CrashBot:
                 "live_multiplier": self.live_multiplier,
                 "site_message": self.site_message,
                 "chrome_cdp": _cdp_alive(),
+                "feed": self._feed.snapshot(),
                 "config": self.engine.config.to_dict(),
             }
         )
@@ -155,6 +158,7 @@ class CrashBot:
         self.live_multiplier = None
         self.awaiting_login = False
         self.betting_enabled = False
+        self._feed = CrashNetworkFeed()
         self._login_ready.clear()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run_thread, daemon=True)
@@ -309,15 +313,17 @@ class CrashBot:
                     self._emit()
                     return
 
+                await self._attach_network_listeners(page)
+
                 self.betting_enabled = False
                 self.site_message = (
-                    "Browser connected — watching site. "
+                    "Browser connected — watching site + network. "
                     "Click Start bet under settings when ready."
                 )
                 self._emit()
 
                 last_phase = "unknown"
-                pending_bet: dict[str, float] | None = None
+                pending_bet: dict[str, Any] | None = None
 
                 while not self._stop.is_set():
                     if self._refresh_balance:
@@ -355,117 +361,89 @@ class CrashBot:
                         await asyncio.sleep(1)
                         continue
 
-                    mult = await self._read_multiplier(page)
+                    # Prefer network live mult; fall back to DOM
+                    snap = self._feed.snapshot()
+                    mult = snap.get("live_multiplier")
+                    if mult is None:
+                        mult = await self._read_multiplier(page)
                     if mult is not None:
                         self.live_multiplier = mult
                         self.engine.state.last_multiplier_seen = mult
 
-                    phase = await self._detect_phase(page, mult)
+                    phase = snap.get("phase_hint") or await self._detect_phase(page, mult)
+                    if phase not in ("betting", "flying", "crashed"):
+                        phase = await self._detect_phase(page, mult)
+
+                    # Settle outstanding bet before placing another
+                    if pending_bet is not None:
+                        settled = await self._settle_pending(page, pending_bet)
+                        if settled:
+                            pending_bet = None
+                        # Do not open a new bet while one is pending
+                        last_phase = phase
+                        self._emit()
+                        await asyncio.sleep(0.25)
+                        continue
 
                     if phase == "betting" and last_phase != "betting":
                         if not self.betting_enabled:
-                            pending_bet = None
                             self.site_message = (
                                 "Watching rounds (betting OFF). Click Start bet to play."
                             )
                         elif self.engine.state.mode == Mode.RESTING:
-                            # Count this round as rest (no bet)
                             self.engine.on_round_skipped()
                             self.site_message = self.engine.state.message
-                            pending_bet = None
-                            # Rest finished on this tick → place first recovery on NEXT round
-                            # (message already says Recovery ready)
-                        elif self.engine.state.mode == Mode.RECOVERY:
-                            pending_bet = self.engine.next_bet()
-                            if pending_bet:
+                        else:
+                            nxt = self.engine.next_bet()
+                            if nxt:
                                 bal = await self._read_balance(page)
-                                stake = pending_bet["stake"]
-                                if bal is not None and stake > bal + 1e-9:
-                                    # Stop betting only — keep browser connected
+                                stake = nxt["stake"]
+                                if (
+                                    self.engine.state.mode == Mode.RECOVERY
+                                    and bal is not None
+                                    and stake > bal + 1e-9
+                                ):
                                     self.engine.state.message = (
                                         f"Recovery blocked: need {stake}, balance {bal}. "
                                         f"Betting stopped — deposit or lower B, then Start bet."
                                     )
                                     self.site_message = self.engine.state.message
                                     self.betting_enabled = False
-                                    pending_bet = None
                                     self._emit()
-                                else:
-                                    ok = await self._place_bet(
-                                        page, stake, pending_bet["cashout"]
-                                    )
-                                    if ok:
-                                        self.site_message = (
-                                            f"RECOVERY bet {stake} "
-                                            f"@ {pending_bet['cashout']}x "
-                                            f"({self.engine.state.recovery_left} left)"
-                                        )
-                                    else:
-                                        self.site_message = (
-                                            "Recovery bet fill failed — will retry next round"
-                                        )
-                                        pending_bet = None
-                            else:
-                                self.site_message = self.engine.state.message
-                                pending_bet = None
-                        else:
-                            pending_bet = self.engine.next_bet()
-                            if pending_bet:
-                                bal = await self._read_balance(page)
-                                if bal is not None and pending_bet["stake"] > bal + 1e-9:
+                                elif bal is not None and stake > bal + 1e-9:
                                     self.site_message = (
-                                        f"Skip bet: stake {pending_bet['stake']} > balance {bal}"
+                                        f"Skip bet: stake {stake} > balance {bal}"
                                     )
-                                    pending_bet = None
                                 else:
+                                    crash_seq = self._feed.crash_seq
                                     ok = await self._place_bet(
-                                        page,
-                                        pending_bet["stake"],
-                                        pending_bet["cashout"],
+                                        page, stake, nxt["cashout"]
                                     )
                                     if ok:
+                                        pending_bet = {
+                                            **nxt,
+                                            "placed_ts": time.time(),
+                                            "crash_seq": crash_seq,
+                                        }
+                                        tag = (
+                                            "RECOVERY"
+                                            if self.engine.state.mode == Mode.RECOVERY
+                                            else "Bet"
+                                        )
                                         self.site_message = (
-                                            f"Placed bet {pending_bet['stake']} "
-                                            f"@ {pending_bet['cashout']}x"
+                                            f"{tag} {stake} @ {nxt['cashout']}x "
+                                            f"(waiting network settle)"
                                         )
                                     else:
                                         self.site_message = (
-                                            "Could not fill/click bet — check selectors / UI"
+                                            "Could not fill/click bet — will retry next round"
                                         )
-                                        pending_bet = None
                             else:
                                 self.site_message = self.engine.state.message
-                                pending_bet = None
-
-                    if phase == "crashed" and last_phase not in ("crashed", "unknown"):
-                        if pending_bet is not None:
-                            cashout = pending_bet["cashout"]
-                            # Real crash from history strip — NOT cashout (1.45) marker
-                            await asyncio.sleep(0.45)
-                            crash_at = await self._read_latest_history_crash(page)
-                            if crash_at is None:
-                                crash_at = await self._read_crashed_at_text(page)
-                            if crash_at is None and mult and mult > cashout + 0.05:
-                                # live mult only if clearly above cashout (avoid 1.45 UI ghost)
-                                crash_at = mult
-                            won = (
-                                crash_at is not None and crash_at + 1e-9 >= cashout
-                            )
-                            self.engine.on_bet_result(
-                                won=won,
-                                stake=pending_bet["stake"],
-                                crash_at=crash_at,
-                            )
-                            self.site_message = (
-                                f"{'Win' if won else 'Lose'} @ crash "
-                                f"{crash_at if crash_at is not None else '?'}x "
-                                f"(cashout {cashout}x) | {self.engine.state.message}"
-                            )
-                            pending_bet = None
 
                     last_phase = phase
                     self._emit()
-                    await asyncio.sleep(0.35)
+                    await asyncio.sleep(0.3)
 
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
@@ -484,6 +462,123 @@ class CrashBot:
                 if "Chrome closed" not in self.site_message:
                     self.site_message = "Bot stopped — Chrome left open (session kept)"
             self._emit()
+
+    async def _attach_network_listeners(self, page) -> None:
+        """Hook Playwright websocket frames (+ CDP if available)."""
+        feed = self._feed
+
+        def _frame_to_text(payload: Any) -> Any:
+            if isinstance(payload, dict):
+                return payload.get("payloadData") or payload.get("payload") or payload
+            return payload
+
+        def on_ws(ws) -> None:
+            try:
+                ws.on("framereceived", lambda payload: feed.handle_frame(_frame_to_text(payload)))
+                ws.on("framesent", lambda payload: feed.handle_frame(_frame_to_text(payload)))
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            page.on("websocket", on_ws)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Also attach to already-open sockets via CDP Network events
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            await cdp.send("Network.enable")
+
+            def _on_ws_frame(params: dict) -> None:
+                try:
+                    resp = params.get("response") or {}
+                    payload = resp.get("payloadData")
+                    if payload:
+                        feed.handle_frame(payload)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            cdp.on("Network.webSocketFrameReceived", _on_ws_frame)
+            cdp.on("Network.webSocketFrameSent", _on_ws_frame)
+            self.site_message = "Network listeners attached (WebSocket)"
+            self._emit()
+        except Exception as exc:  # noqa: BLE001
+            self.site_message = f"WS hook limited ({exc}); using page websockets + DOM fallback"
+
+    async def _settle_pending(self, page, pending_bet: dict[str, Any]) -> bool:
+        """Settle using network outcome/crash first, then careful DOM fallback."""
+        cashout = float(pending_bet["cashout"])
+        stake = float(pending_bet["stake"])
+        placed_ts = float(pending_bet.get("placed_ts") or 0)
+        min_seq = int(pending_bet.get("crash_seq") or 0)
+
+        # 1) Explicit bet outcome from network
+        outcome = self._feed.pop_outcome_since(placed_ts)
+        if outcome is not None:
+            crash_at = outcome.crash_at
+            if crash_at is None and self._feed.crash_seq > min_seq:
+                crash_at = self._feed.last_crash
+            won = outcome.won
+            # If outcome says won but crash known and below cashout, trust crash
+            if crash_at is not None:
+                won = crash_at + 1e-9 >= cashout
+            self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
+            self.site_message = (
+                f"{'Win' if won else 'Lose'} via {outcome.source} "
+                f"crash={crash_at if crash_at is not None else '?'}x | "
+                f"{self.engine.state.message}"
+            )
+            return True
+
+        # 2) New crash point from network after we placed
+        if self._feed.crash_seq > min_seq and self._feed.last_crash is not None:
+            crash_at = float(self._feed.last_crash)
+            won = crash_at + 1e-9 >= cashout
+            self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
+            self.site_message = (
+                f"{'Win' if won else 'Lose'} via network crash {crash_at}x "
+                f"(cashout {cashout}x) | {self.engine.state.message}"
+            )
+            return True
+
+        # 3) DOM fallback only after crashed phase + new history chip
+        phase = await self._detect_phase(page, self.live_multiplier)
+        feed_phase = self._feed.phase_hint
+        if phase == "crashed" or feed_phase == "crashed":
+            # Wait a moment for history chip update
+            if time.time() - placed_ts < 1.0:
+                return False
+            crash_at = await self._read_latest_history_crash(page)
+            if crash_at is None:
+                crash_at = await self._read_crashed_at_text(page)
+            # Reject cashout-looking ghosts: if crash == cashout exactly, prefer lose only
+            # when history is clearly below — if equal, treat as win (auto cashout hit)
+            if crash_at is not None:
+                # Ignore if this crash was already used
+                if pending_bet.get("dom_crash") == crash_at:
+                    return False
+                # Require crash to look like a real bust point: either clearly above cashout
+                # (win) or clearly below (lose). Equal → win (cashed out).
+                won = crash_at + 1e-9 >= cashout
+                pending_bet["dom_crash"] = crash_at
+                self._feed.note_crash(crash_at, source="dom-history")
+                self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
+                self.site_message = (
+                    f"{'Win' if won else 'Lose'} via DOM history {crash_at}x "
+                    f"(cashout {cashout}x) | {self.engine.state.message}"
+                )
+                return True
+
+            # Last resort after long wait: if still no crash, don't invent a win
+            if time.time() - placed_ts > 12:
+                self.engine.on_bet_result(won=False, stake=stake, crash_at=None)
+                self.site_message = (
+                    "Settle timeout — counted as LOSE (no crash data). "
+                    f"{self.engine.state.message}"
+                )
+                return True
+
+        return False
 
     async def _first_locator(self, page, keys: list[str]):
         for sel in keys:
