@@ -99,8 +99,13 @@ class CrashBot:
             return
         self._last_log = msg
         self._last_log_ts = now
-        print(f"[bot {time.strftime('%H:%M:%S')}] {msg}", flush=True)
-        sys.stdout.flush()
+        line = f"[bot {time.strftime('%H:%M:%S')}] {msg}"
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            sys.stdout.buffer.write((line + "\n").encode(enc, errors="replace"))
+            sys.stdout.flush()
 
     def ensure_real_chrome(self) -> dict[str, Any]:
         """Start real Google Chrome with remote debugging (same window for login + bot)."""
@@ -381,10 +386,6 @@ class CrashBot:
 
                     cashout_cfg = float(self.engine.config.cashout)
                     raw_mult = await self._read_multiplier(page)
-                    # Ignore cashout-field ghosts (1.45) when not actually flying
-                    if raw_mult is not None and abs(float(raw_mult) - cashout_cfg) < 0.021:
-                        if pending_bet is None or float(pending_bet.get("peak_mult") or 0) < cashout_cfg - 0.05:
-                            raw_mult = None
                     if raw_mult is not None:
                         self.live_multiplier = raw_mult
                         self.engine.state.last_multiplier_seen = raw_mult
@@ -394,31 +395,46 @@ class CrashBot:
                     phase = await self._detect_phase(page, self.live_multiplier)
                     if phase != last_logged_phase:
                         self._log(
-                            f"phase {last_phase} → {phase}  live={self.live_multiplier}  "
+                            f"phase {last_phase} -> {phase}  live={self.live_multiplier}  "
                             f"bet_on={self.betting_enabled}  pending={pending_bet is not None}"
                         )
                         last_logged_phase = phase
 
                     # Settle previous bet from DOM before opening another
                     if pending_bet is not None:
+                        # Snapshot history ids only before our round starts
+                        if not pending_bet.get("saw_round"):
+                            row0 = await self._read_history_row(page)
+                            if row0:
+                                pending_bet["hist_row"] = row0
+                                pending_bet["hist_max_id"] = max(
+                                    int(x.get("id") or 0) for x in row0
+                                )
+                                self._log(
+                                    "hist baseline ids "
+                                    + str([int(x["id"]) for x in row0[-4:]])
+                                    + " v="
+                                    + str([round(x["v"], 2) for x in row0[-4:]]),
+                                    repeat_s=8,
+                                )
                         if self.live_multiplier is not None:
                             mult = float(self.live_multiplier)
                             peak = float(pending_bet.get("peak_mult") or 0.0)
-                            cashout_ghost = (
-                                abs(mult - cashout_cfg) < 0.021
-                                and peak + 1e-9 < cashout_cfg - 0.05
-                            )
-                            if mult > peak + 1e-9 and not cashout_ghost:
+                            if mult > peak + 1e-9:
                                 pending_bet["peak_mult"] = mult
                                 pending_bet["peak_ts"] = time.time()
-                            if mult > 1.001 and mult + 1e-9 < cashout_cfg - 0.01:
-                                prev = float(pending_bet.get("max_below_cashout") or 0.0)
-                                if mult > prev:
-                                    pending_bet["max_below_cashout"] = mult
-                            if mult > 1.001 and not cashout_ghost:
+                            if mult > 1.001:
                                 pending_bet["saw_flying"] = True
+                                pending_bet["saw_round"] = True
                         if phase == "flying":
                             pending_bet["saw_flying"] = True
+                            pending_bet["saw_round"] = True
+                        # Live multiplier often unread — leaving the betting
+                        # countdown still means the round started.
+                        if phase in ("flying", "crashed", "unknown"):
+                            pending_bet["saw_round"] = True
+                        if phase == "betting" and pending_bet.get("saw_round"):
+                            pending_bet.setdefault("back_to_bet_ts", time.time())
                         settled = await self._settle_pending(page, pending_bet, phase)
                         age = time.time() - float(pending_bet.get("placed_ts") or 0)
                         if settled:
@@ -484,7 +500,7 @@ class CrashBot:
                                     )
                                     self._log(self.site_message)
                                 else:
-                                    hist = await self._read_latest_history_crash(page)
+                                    hist_row = await self._read_history_row(page)
                                     ok = await self._place_bet(
                                         page, stake, nxt["cashout"]
                                     )
@@ -492,12 +508,16 @@ class CrashBot:
                                         pending_bet = {
                                             **nxt,
                                             "placed_ts": time.time(),
-                                            "hist_at_place": hist,
+                                            "hist_row": list(hist_row or []),
+                                            "hist_max_id": max(
+                                                (int(x.get("id") or 0) for x in (hist_row or [])),
+                                                default=0,
+                                            ),
                                             "bal_at_place": bal,
                                             "peak_mult": 1.0,
                                             "peak_ts": time.time(),
                                             "saw_flying": False,
-                                            "max_below_cashout": 0.0,
+                                            "saw_round": False,
                                         }
                                         tag = (
                                             "RECOVERY"
@@ -508,7 +528,8 @@ class CrashBot:
                                             f"{tag} {stake} @ {nxt['cashout']}x placed"
                                         )
                                         self._log(
-                                            f"{self.site_message} (hist_at_place={hist})"
+                                            f"{self.site_message} (hist_row="
+                                            f"{[x.get('v') if isinstance(x, dict) else x for x in (hist_row or [])][-5:]})"
                                         )
                                     else:
                                         self.site_message = (
@@ -541,132 +562,164 @@ class CrashBot:
                     self.site_message = "Bot stopped — Chrome left open (session kept)"
             self._emit()
 
+    @staticmethod
+    def _new_crash_from_rows(
+        before: list | None, after: list | None
+    ) -> float | None:
+        """Newest crash = highest round id that was not present when we placed."""
+        if not after:
+            return None
+
+        def _items(row: list) -> list[dict[str, float]]:
+            out: list[dict[str, float]] = []
+            for x in row or []:
+                if isinstance(x, dict) and "v" in x:
+                    out.append({"id": float(x.get("id") or 0), "v": float(x["v"])})
+                elif isinstance(x, (int, float)):
+                    out.append({"id": 0.0, "v": float(x)})
+            return out
+
+        b = _items(before or [])
+        a = _items(after)
+        if not a or not b:
+            return None
+        b_ids = {int(x["id"]) for x in b if x["id"]}
+        if b_ids:
+            newer = [x for x in a if int(x["id"]) not in b_ids]
+            if newer:
+                newest = max(newer, key=lambda x: x["id"])
+                return float(newest["v"])
+            return None
+        # Fallback: values only
+        bv = [round(x["v"], 2) for x in b]
+        av = [round(x["v"], 2) for x in a]
+        if av == bv or not av:
+            return None
+        if av[-1] != (bv[-1] if bv else None):
+            return float(a[-1]["v"])
+        if av[0] != (bv[0] if bv else None):
+            return float(a[0]["v"])
+        return None
+
     async def _settle_pending(
         self, page, pending_bet: dict[str, Any], phase: str | None = None
     ) -> bool:
-        """Settle win/lose from peak live mult + history (handles instant 1.0x busts)."""
+        """After our round: wallet up = win; still down on next countdown = lose."""
         cashout = float(pending_bet["cashout"])
         stake = float(pending_bet["stake"])
         placed_ts = float(pending_bet.get("placed_ts") or 0)
-        hist_at_place = pending_bet.get("hist_at_place")
+        hist_row_before = pending_bet.get("hist_row") or []
         bal_at_place = pending_bet.get("bal_at_place")
         peak = float(pending_bet.get("peak_mult") or 0.0)
-        peak_ts = float(pending_bet.get("peak_ts") or placed_ts)
-        saw_flying = bool(pending_bet.get("saw_flying"))
+        saw_round = bool(pending_bet.get("saw_round") or pending_bet.get("saw_flying"))
         age = time.time() - placed_ts
         live = self.live_multiplier
-        peak_frozen = (time.time() - peak_ts) >= 0.65
 
         if phase is None:
             phase = await self._detect_phase(page, live)
 
-        # Mid-flight only when clearly climbing. Stuck 1.02x is NOT flying.
-        still_flying = live is not None and live > 1.12
-        if still_flying and age < 25:
-            self._log(f"settle wait: still flying live={live}", repeat_s=2)
+        hist_row = await self._read_history_row(page)
+        max_id = int(pending_bet.get("hist_max_id") or 0)
+        new_crash = None
+        newer = [
+            x
+            for x in hist_row
+            if isinstance(x, dict) and int(x.get("id") or 0) > max_id
+        ]
+        if newer:
+            newest = max(newer, key=lambda x: int(x.get("id") or 0))
+            new_crash = float(newest["v"])
+            self._log(
+                f"hist new id={int(newest['id'])} crash={new_crash} "
+                f"(max_id={max_id})",
+                repeat_s=2,
+            )
+        elif hist_row_before:
+            new_crash = self._new_crash_from_rows(hist_row_before, hist_row)
+
+        still_flying = phase == "flying" or (live is not None and live > 1.20)
+        if still_flying and new_crash is None and age < 40:
+            self._log(f"settle wait: flying live={live} peak={peak:.2f}", repeat_s=3)
             return False
 
-        # Countdown after placing — round has not started yet
-        if not saw_flying and phase == "betting" and age < 8.0:
-            self._log(f"settle wait: countdown (round not started) {age:.1f}s", repeat_s=2)
+        if not saw_round and new_crash is None and age < 14.0:
+            self._log(f"settle wait: round not started {age:.1f}s phase={phase}", repeat_s=3)
             return False
 
-        if age < 0.6:
+        if new_crash is not None and abs(float(new_crash) - cashout) < 0.021:
+            if not hist_row or len(hist_row) <= 1:
+                new_crash = None
+
+        if age < 0.7 and new_crash is None:
             return False
 
-        hist = await self._read_latest_history_crash(page)
-        # Ignore cashout setting masquerading as a history chip
-        if hist is not None and abs(float(hist) - cashout) < 0.021:
-            # Only keep it if we truly climbed past cashout
-            if peak + 1e-9 < cashout:
-                hist = None
-
-        hist_changed = (
-            hist is not None
-            and hist_at_place is not None
-            and abs(float(hist) - float(hist_at_place)) > 1e-9
-        )
+        betting_window = phase == "betting"
+        back_ts = pending_bet.get("back_to_bet_ts")
+        since_next_bet = (time.time() - float(back_ts)) if back_ts else 0.0
 
         won: bool | None = None
-        crash_at: float | None = None
+        crash_at: float | None = new_crash
         source = ""
-
-        # 1) History below cashout ALWAYS loses — beats peak/cashout ghosts
-        if hist_changed and hist is not None and float(hist) + 1e-9 < cashout:
-            won = False
-            crash_at = float(hist)
-            source = f"history-lose {crash_at}x"
-
-        # 2) History above cashout → win
-        elif hist_changed and hist is not None and float(hist) + 1e-9 >= cashout:
-            won = True
-            crash_at = float(hist)
-            source = f"history-win {crash_at}x"
-
-        # 3) Peak truly reached cashout (must have climbed toward it — not a lone 1.45 ghost)
-        elif peak + 1e-9 >= cashout and (
-            peak > cashout + 0.03
-            or float(pending_bet.get("max_below_cashout") or 0) >= cashout - 0.15
-        ):
-            won = True
-            crash_at = hist if hist_changed else peak
-            source = f"peak {peak:.2f}x"
-
-        # 4) Low bust (1.00–just under cashout): peak froze below cashout
-        elif (
-            saw_flying
-            and peak + 1e-9 < cashout
-            and peak_frozen
-            and (phase in ("crashed", "betting", "unknown") or age >= 1.2)
-        ):
-            won = False
-            crash_at = float(hist) if hist is not None else peak
-            source = f"fast-bust {crash_at}x"
-
-        # 5) Flight done, never reached cashout, next betting window
-        elif (
-            saw_flying
-            and peak + 1e-9 < cashout
-            and phase == "betting"
-            and age >= 2.0
-        ):
-            won = False
-            crash_at = float(hist) if hist is not None else (peak if peak >= 1.0 else None)
-            source = f"bust-after-flight {crash_at if crash_at is not None else peak:.2f}x"
-
-        # 6) Wallet delta backup
-        if won is None and bal_at_place is not None and age >= 2.0:
+        delta: float | None = None
+        if bal_at_place is not None:
             bal = await self._read_balance(page)
             if bal is not None:
                 delta = float(bal) - float(bal_at_place)
-                profit_min = stake * (cashout - 1.0) * 0.4
-                if delta >= profit_min:
-                    won = True
-                    crash_at = hist if hist_changed else peak or None
-                    source = f"balance +{delta:.4f}"
-                elif delta <= -stake * 0.5:
-                    won = False
-                    crash_at = hist if hist is not None else None
-                    source = f"balance {delta:.4f}"
+        profit = stake * (cashout - 1.0)
+
+        # 1) Wallet payout = win (lags a few seconds into next countdown)
+        if delta is not None and delta >= max(0.0001, profit * 0.25):
+            won = True
+            source = f"wallet +{delta:.4f}"
+
+        # 2) New history chip with crash < cashout = lose NOW (even mid-crash UI),
+        #    so the multiplied bet still makes the next "Starts in" window.
+        if won is None and new_crash is not None and float(new_crash) + 1e-9 < cashout:
+            won = False
+            crash_at = float(new_crash)
+            source = f"history {crash_at}x"
+            self._log(f"new crash chip {crash_at} (was {hist_row_before[:3]} now {hist_row[:3]})")
+
+        # 3) High crash chip = win only before we already know stake was lost
+        if (
+            won is None
+            and new_crash is not None
+            and float(new_crash) + 1e-9 >= cashout
+            and not (delta is not None and delta <= -stake * 0.35 and since_next_bet >= 6.5)
+        ):
+            won = True
+            crash_at = float(new_crash)
+            source = f"history {crash_at}x"
+            self._log(f"new crash chip {crash_at} (was {hist_row_before[:3]} now {hist_row[:3]})")
+
+        # 4) Peak reached cashout
+        if won is None and peak + 1e-9 >= cashout and (betting_window or age >= 4.0):
+            won = True
+            crash_at = peak
+            source = f"peak {peak:.2f}x"
+
+        # 5) Wallet-only fallback if history chips were missed. Prefer history (step 2)
+        #    so we settle during crash and still place in the same "Starts in" window.
+        if (
+            won is None
+            and saw_round
+            and betting_window
+            and since_next_bet >= 6.5
+            and delta is not None
+            and delta <= -stake * 0.35
+            and peak + 1e-9 < cashout
+        ):
+            won = False
+            crash_at = new_crash
+            source = f"wallet {delta:.4f} no payout"
 
         if won is None:
-            if age >= 12.0:
-                # Prefer lose when peak never clearly beat cashout
-                if peak + 1e-9 >= cashout and peak > cashout + 0.02:
-                    won = True
-                    crash_at = peak
-                    source = "timeout-peak-win"
-                else:
-                    won = False
-                    crash_at = hist if hist is not None else (peak if peak >= 1.0 else None)
-                    source = "timeout-lose"
-            else:
-                self._log(
-                    f"settle wait: no result yet age={age:.1f}s phase={phase} "
-                    f"peak={peak} hist={hist} hist_chg={hist_changed} fly={saw_flying}",
-                    repeat_s=2,
-                )
-                return False
+            self._log(
+                f"settle wait {age:.1f}s phase={phase} saw_round={saw_round} "
+                f"next_bet_for={since_next_bet:.1f}s delta={delta} new={new_crash} peak={peak:.2f}",
+                repeat_s=3,
+            )
+            return False
 
         self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
         nxt = self.engine.next_bet()
@@ -795,37 +848,82 @@ class CrashBot:
             return None
         return None
 
-    async def _read_latest_history_crash(self, page) -> float | None:
-        """Read newest crash from the top history chips (e.g. 40.94x), not cashout 1.45."""
+    async def _read_history_row(self, page) -> list[dict[str, float]]:
+        """History pills: round id (9536465) + crash (1.00x). Newest = highest id."""
         try:
             val = await page.evaluate(
                 """() => {
-                  const chips = [];
-                  for (const el of document.querySelectorAll('div, span, a, button')) {
+                  const xRe = /^(\\d+\\.\\d+)\\s*[x×]$/i;
+                  const idRe = /^(\\d{6,8})$/;
+                  const found = new Map();
+                  const els = document.querySelectorAll('div, span, a, p, b');
+                  for (const el of els) {
                     if (el.offsetParent === null) continue;
-                    const t = (el.innerText || '').trim();
-                    if (!/^\\d+(\\.\\d+)?x$/i.test(t)) continue;
-                    if (t.length > 12) continue;
+                    if (el.closest('input,label,form,textarea,[role="dialog"]')) continue;
+                    const raw = (el.innerText || '').trim();
+                    if (!raw || raw.length > 32) continue;
+                    const t = raw.replace(/\\s+/g, ' ');
                     const r = el.getBoundingClientRect();
-                    // History strip is near the top of the game panel
-                    if (r.top < 40 || r.top > 280 || r.width < 8) continue;
-                    const v = parseFloat(t);
-                    if (v >= 1) chips.push({ v, left: r.left, top: r.top });
+                    if (r.top < 0 || r.top > 380) continue;
+                    if (r.width < 6 || r.height < 8) continue;
+                    if (r.width > 160) continue;
+
+                    let id = null, v = null;
+                    let m = t.match(/^(\\d{6,8})\\s+(\\d+\\.\\d+)\\s*[x×]$/i);
+                    if (m) {
+                      id = Number(m[1]);
+                      v = parseFloat(m[2]);
+                    } else if (xRe.test(t) && el.children.length === 0) {
+                      v = parseFloat(t);
+                      const p = el.parentElement;
+                      if (p) {
+                        const pm = (p.innerText || '').replace(/\\s+/g, ' ').match(/(\\d{6,8})/);
+                        if (pm) id = Number(pm[1]);
+                      }
+                      let sib = el.previousElementSibling;
+                      for (let i = 0; i < 5 && sib && !id; i++) {
+                        const st = (sib.innerText || '').trim();
+                        if (idRe.test(st)) id = Number(st);
+                        sib = sib.previousElementSibling;
+                      }
+                    } else if (idRe.test(t) && el.children.length === 0) {
+                      id = Number(t);
+                      let sib = el.nextElementSibling;
+                      for (let i = 0; i < 5 && sib && v == null; i++) {
+                        const st = (sib.innerText || '').trim();
+                        const xm = st.match(xRe);
+                        if (xm) v = parseFloat(xm[1]);
+                        sib = sib.nextElementSibling;
+                      }
+                    }
+                    if (id && v >= 1 && v < 1000000) {
+                      const prev = found.get(id);
+                      if (!prev || r.width * r.height < prev.area) {
+                        found.set(id, { id, v, area: r.width * r.height });
+                      }
+                    }
                   }
-                  if (!chips.length) return null;
-                  // Prefer the top-most row; newest is usually left-most on BC.Game
-                  chips.sort((a, b) => a.top - b.top || a.left - b.left);
-                  const topY = chips[0].top;
-                  const row = chips.filter((c) => Math.abs(c.top - topY) < 20);
-                  row.sort((a, b) => a.left - b.left);
-                  return row[0].v;
+                  return Array.from(found.values())
+                    .sort((a, b) => a.id - b.id)
+                    .slice(-24)
+                    .map((c) => ({ id: c.id, v: c.v }));
                 }"""
             )
-            if isinstance(val, (int, float)) and val >= 1:
-                return float(val)
+            if isinstance(val, list):
+                out: list[dict[str, float]] = []
+                for item in val:
+                    if isinstance(item, dict) and "v" in item:
+                        out.append({"id": float(item.get("id") or 0), "v": float(item["v"])})
+                    elif isinstance(item, (int, float)):
+                        out.append({"id": 0.0, "v": float(item)})
+                return out
         except Exception:  # noqa: BLE001
             pass
-        return None
+        return []
+
+    async def _read_latest_history_crash(self, page) -> float | None:
+        row = await self._read_history_row(page)
+        return float(row[-1]["v"]) if row else None
 
     async def _read_crashed_at_text(self, page) -> float | None:
         try:
@@ -1007,14 +1105,6 @@ class CrashBot:
             return "flying"
         if hint == "crashed":
             return "crashed"
-        if mult is None or mult <= 1.12:
-            # Bet button is always on the page — only call it betting if no live climb
-            try:
-                btn = page.get_by_role("button", name=re.compile(r"^Bet$|^Main Bet|Bet \(Next Round\)", re.I))
-                if await btn.count() and await btn.first.is_visible():
-                    return "betting"
-            except Exception:  # noqa: BLE001
-                pass
         return "unknown"
 
     async def _result_hint(self, page) -> bool | None:

@@ -169,7 +169,7 @@ class StrategyEngine:
             st.current_stake = cfg.base_stake
             st.recovery_left = 0
             st.recovery_stake = 0.0
-            st.message = f"Win +{profit:.4f} → reset to base {cfg.base_stake}"
+            st.message = f"Win +{profit:.4f} -> reset to base {cfg.base_stake}"
         else:
             st.session_pnl -= stake
             st.total_lost += stake
@@ -202,7 +202,7 @@ class StrategyEngine:
             else:
                 st.current_stake = round(stake * cfg.loss_multiplier, 8)
                 st.message = (
-                    f"Loss → next stake {st.current_stake} "
+                    f"Loss -> next stake {st.current_stake} "
                     f"({st.consecutive_losses}/{cfg.losses_before_rest})"
                 )
 
