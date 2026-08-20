@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BC Crash Bot</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>BC Crash Bot</h1>
+      <p class="sub">Live site numbers + editable strategy</p>
+    </header>
+
+    <section class="live">
+      <div class="metric big">
+        <span class="label">Live multiplier</span>
+        <span id="liveMult" class="value">—</span>
+      </div>
+      <div class="metric">
+        <span class="label">Mode</span>
+        <span id="mode" class="pill">idle</span>
+      </div>
+      <div class="metric">
+        <span class="label">Next / current stake</span>
+        <span id="stake" class="value">—</span>
+      </div>
+      <div class="metric">
+        <span class="label">Session P/L</span>
+        <span id="pnl" class="value">0</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h2>Status</h2>
+        <dl>
+          <div><dt>Bot</dt><dd id="botRunning">off</dd></div>
+          <div><dt>Message</dt><dd id="message">—</dd></div>
+          <div><dt>Site</dt><dd id="siteMessage">—</dd></div>
+          <div><dt>Consecutive losses</dt><dd id="lossesStreak">0</dd></div>
+          <div><dt>Rest left</dt><dd id="restLeft">0</dd></div>
+          <div><dt>Recovery left</dt><dd id="recLeft">0</dd></div>
+          <div><dt>Wins / Losses</dt><dd id="wl">0 / 0</dd></div>
+          <div><dt>Bets</dt><dd id="bets">0</dd></div>
+          <div><dt>Last result</dt><dd id="lastResult">—</dd></div>
+          <div><dt>Last crash</dt><dd id="lastCrash">—</dd></div>
+        </dl>
+        <div class="actions">
+          <button id="btnStart" class="primary">Start browser bot</button>
+          <button id="btnStop">Stop</button>
+          <button id="btnReset">Reset strategy</button>
+        </div>
+        <p class="hint">Start opens Chromium → log into BC.Game → open Crash. Bot auto-fills stake + 1.45x and clicks Bet.</p>
+      </div>
+
+      <div class="card">
+        <h2>Editable settings</h2>
+        <form id="cfgForm">
+          <label>Base stake B <input name="base_stake" type="number" step="any" /></label>
+          <label>Cash out <input name="cashout" type="number" step="any" /></label>
+          <label>Loss multiplier <input name="loss_multiplier" type="number" step="any" /></label>
+          <label>Losses before rest <input name="losses_before_rest" type="number" step="1" /></label>
+          <label>Rest rounds <input name="rest_rounds" type="number" step="1" /></label>
+          <label>Recovery attempts <input name="recovery_attempts" type="number" step="1" /></label>
+          <label>Stop loss <input name="stop_loss" type="number" step="any" /></label>
+          <label>Site URL <input name="site_url" type="text" /></label>
+          <button type="submit" class="primary">Save settings</button>
+        </form>
+        <p id="saveMsg" class="hint"></p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Recent bets</h2>
+      <table>
+        <thead>
+          <tr><th>Result</th><th>Stake</th><th>Profit</th><th>Crash</th></tr>
+        </thead>
+        <tbody id="history"></tbody>
+      </table>
+    </section>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

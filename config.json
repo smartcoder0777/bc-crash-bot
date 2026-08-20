@@ -1,0 +1,37 @@
+{
+  "base_stake": 0.2,
+  "cashout": 1.45,
+  "loss_multiplier": 3.15,
+  "losses_before_rest": 4,
+  "rest_rounds": 10,
+  "recovery_attempts": 2,
+  "stop_loss": 50,
+  "site_url": "https://bc.game/game/crash",
+  "headless": false,
+  "selectors": {
+    "bet_amount": [
+      "input[data-testid='bet-amount']",
+      "input[placeholder*='Amount' i]",
+      ".bet-input input",
+      "input[type='number']"
+    ],
+    "cashout": [
+      "input[data-testid='cashout']",
+      "input[placeholder*='Cash' i]",
+      "input[placeholder*='Payout' i]",
+      ".cashout-input input"
+    ],
+    "bet_button": [
+      "button:has-text('Bet')",
+      "button:has-text('Place Bet')",
+      "[data-testid='bet-button']",
+      "button.bet-button"
+    ],
+    "multiplier": [
+      ".crash-multiplier",
+      "[data-testid='multiplier']",
+      ".game-multiplier",
+      "div:has-text('x')"
+    ]
+  }
+}
