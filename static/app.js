@@ -5,6 +5,7 @@ const el = (id) => document.getElementById(id);
 
 let historyCache = [];
 let page = 1;
+let settingsDirty = false;
 
 function fillForm(cfg) {
   const form = el("cfgForm");
@@ -13,6 +14,47 @@ function fillForm(cfg) {
   }
   if (cfg.site_url && form.elements.site_url) {
     form.elements.site_url.value = cfg.site_url;
+  }
+}
+
+function setSaveClean() {
+  settingsDirty = false;
+  const btn = el("btnSave");
+  btn.textContent = "Saved";
+  btn.disabled = true;
+}
+
+function setSaveDirty() {
+  settingsDirty = true;
+  const btn = el("btnSave");
+  btn.textContent = "Save settings";
+  btn.disabled = false;
+}
+
+function updateBetButtons(s) {
+  const startBtn = el("btnStartBet");
+  const stopBtn = el("btnStopBet");
+  const connected = !!s.bot_running;
+  const betting = !!s.betting_enabled;
+
+  if (!connected) {
+    startBtn.textContent = "Start bet";
+    stopBtn.textContent = "Stop bet";
+    startBtn.disabled = true;
+    stopBtn.disabled = true;
+    return;
+  }
+
+  if (betting) {
+    startBtn.textContent = "Started";
+    startBtn.disabled = true;
+    stopBtn.textContent = "Stop bet";
+    stopBtn.disabled = false;
+  } else {
+    startBtn.textContent = "Start bet";
+    startBtn.disabled = false;
+    stopBtn.textContent = "Stopped";
+    stopBtn.disabled = true;
   }
 }
 
@@ -82,8 +124,7 @@ function render(s, { syncForm = false } = {}) {
   el("botRunning").textContent = s.bot_running ? "RUNNING" : "off";
   el("bettingState").textContent = s.betting_enabled ? "ON" : "off";
   el("bettingState").className = s.betting_enabled ? "win" : "lose";
-  el("btnStartBet").disabled = !s.bot_running;
-  el("btnStopBet").disabled = !s.bot_running;
+  updateBetButtons(s);
   el("btnContinue").disabled = !s.awaiting_login;
   if (s.awaiting_login) {
     el("btnContinue").classList.add("pulse");
@@ -108,7 +149,10 @@ function render(s, { syncForm = false } = {}) {
   historyCache = s.history || [];
   renderHistoryPage();
 
-  if (syncForm && s.config) fillForm(s.config);
+  if (syncForm && s.config) {
+    fillForm(s.config);
+    setSaveClean();
+  }
 }
 
 el("prevPage").onclick = () => {
@@ -131,7 +175,13 @@ fetch("/api/status")
 
 fetch("/api/config")
   .then((r) => r.json())
-  .then((cfg) => fillForm(cfg));
+  .then((cfg) => {
+    fillForm(cfg);
+    setSaveClean();
+  });
+
+el("cfgForm").addEventListener("input", () => setSaveDirty());
+el("cfgForm").addEventListener("change", () => setSaveDirty());
 
 el("btnLoginChrome").onclick = async () => {
   const r = await fetch("/api/open-login", { method: "POST" });
@@ -173,5 +223,8 @@ el("cfgForm").onsubmit = async (e) => {
   });
   const data = await r.json();
   el("saveMsg").textContent = data.ok ? "Settings saved." : data.error || "Save failed";
-  if (data.config) fillForm(data.config);
+  if (data.ok) {
+    if (data.config) fillForm(data.config);
+    setSaveClean();
+  }
 };
