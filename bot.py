@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -63,8 +64,11 @@ class CrashBot:
         self.awaiting_login = False
         self.betting_enabled = False
         self._refresh_balance = False
+        self._kick_bet = False
         self.live_multiplier: float | None = None
         self.site_message = "Browser not started"
+        self._last_log = ""
+        self._last_log_ts = 0.0
 
     @property
     def running(self) -> bool:
@@ -87,6 +91,16 @@ class CrashBot:
 
     def _emit(self) -> None:
         self.on_status(self.status())
+
+    def _log(self, msg: str, *, repeat_s: float = 0.0) -> None:
+        """Print to the dashboard terminal. repeat_s>0 throttles identical lines."""
+        now = time.time()
+        if repeat_s > 0 and msg == self._last_log and now - self._last_log_ts < repeat_s:
+            return
+        self._last_log = msg
+        self._last_log_ts = now
+        print(f"[bot {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+        sys.stdout.flush()
 
     def ensure_real_chrome(self) -> dict[str, Any]:
         """Start real Google Chrome with remote debugging (same window for login + bot)."""
@@ -155,6 +169,7 @@ class CrashBot:
         self.live_multiplier = None
         self.awaiting_login = False
         self.betting_enabled = False
+        self._kick_bet = False
         self._login_ready.clear()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run_thread, daemon=True)
@@ -164,13 +179,16 @@ class CrashBot:
         if not self._running:
             return {"ok": False, "error": "Start browser bot first."}
         self.betting_enabled = True
+        self._kick_bet = True
         self.site_message = "Betting ON — will place bets on next rounds"
+        self._log(self.site_message)
         self._emit()
         return {"ok": True}
 
     def stop_betting(self) -> dict[str, Any]:
         self.betting_enabled = False
         self.site_message = "Betting OFF — browser still connected, watching only"
+        self._log(self.site_message)
         self._emit()
         return {"ok": True}
 
@@ -200,6 +218,7 @@ class CrashBot:
 
         self._running = True
         self.site_message = "Connecting to real Chrome…"
+        self._log(self.site_message)
         self._emit()
 
         browser = None
@@ -318,6 +337,8 @@ class CrashBot:
 
                 last_phase = "unknown"
                 pending_bet: dict[str, Any] | None = None
+                last_logged_phase = ""
+                self._log("Watching Crash page — click Start bet when ready")
 
                 while not self._stop.is_set():
                     if self._refresh_balance:
@@ -331,6 +352,7 @@ class CrashBot:
                             self.site_message = (
                                 "Reset done. Start/current cleared (could not re-read wallet)."
                             )
+                        self._log(self.site_message)
                         self._emit()
 
                     if await self._login_modal_open(page):
@@ -341,6 +363,7 @@ class CrashBot:
                         self.site_message = (
                             "Sign-in appeared — finish login in Chrome, then Continue."
                         )
+                        self._log(self.site_message)
                         self._emit()
                         while not self._stop.is_set() and not self._login_ready.is_set():
                             await asyncio.sleep(0.4)
@@ -351,50 +374,97 @@ class CrashBot:
                     if self.engine.state.mode == Mode.STOPPED:
                         self.betting_enabled = False
                         self.site_message = self.engine.state.message
+                        self._log(self.site_message, repeat_s=5)
                         self._emit()
                         await asyncio.sleep(1)
                         continue
 
-                    mult = await self._read_multiplier(page)
-                    if mult is not None:
-                        self.live_multiplier = mult
-                        self.engine.state.last_multiplier_seen = mult
+                    cashout_cfg = float(self.engine.config.cashout)
+                    raw_mult = await self._read_multiplier(page)
+                    # Ignore cashout-field ghosts (1.45) when not actually flying
+                    if raw_mult is not None and abs(float(raw_mult) - cashout_cfg) < 0.021:
+                        if pending_bet is None or float(pending_bet.get("peak_mult") or 0) < cashout_cfg - 0.05:
+                            raw_mult = None
+                    if raw_mult is not None:
+                        self.live_multiplier = raw_mult
+                        self.engine.state.last_multiplier_seen = raw_mult
+                    elif pending_bet is None:
+                        self.live_multiplier = None
 
-                    phase = await self._detect_phase(page, mult)
+                    phase = await self._detect_phase(page, self.live_multiplier)
+                    if phase != last_logged_phase:
+                        self._log(
+                            f"phase {last_phase} → {phase}  live={self.live_multiplier}  "
+                            f"bet_on={self.betting_enabled}  pending={pending_bet is not None}"
+                        )
+                        last_logged_phase = phase
 
                     # Settle previous bet from DOM before opening another
                     if pending_bet is not None:
-                        if mult is not None:
+                        if self.live_multiplier is not None:
+                            mult = float(self.live_multiplier)
                             peak = float(pending_bet.get("peak_mult") or 0.0)
-                            if mult > peak:
-                                pending_bet["peak_mult"] = float(mult)
+                            cashout_ghost = (
+                                abs(mult - cashout_cfg) < 0.021
+                                and peak + 1e-9 < cashout_cfg - 0.05
+                            )
+                            if mult > peak + 1e-9 and not cashout_ghost:
+                                pending_bet["peak_mult"] = mult
+                                pending_bet["peak_ts"] = time.time()
+                            if mult > 1.001 and mult + 1e-9 < cashout_cfg - 0.01:
+                                prev = float(pending_bet.get("max_below_cashout") or 0.0)
+                                if mult > prev:
+                                    pending_bet["max_below_cashout"] = mult
+                            if mult > 1.001 and not cashout_ghost:
+                                pending_bet["saw_flying"] = True
+                        if phase == "flying":
+                            pending_bet["saw_flying"] = True
                         settled = await self._settle_pending(page, pending_bet, phase)
+                        age = time.time() - float(pending_bet.get("placed_ts") or 0)
                         if settled:
+                            self._log(self.site_message)
                             pending_bet = None
                             if phase == "betting":
                                 last_phase = "settled"
                             else:
                                 last_phase = phase
                         else:
+                            self._log(
+                                f"waiting settle {age:.1f}s phase={phase} "
+                                f"live={self.live_multiplier} peak={pending_bet.get('peak_mult')} "
+                                f"saw_fly={pending_bet.get('saw_flying')}",
+                                repeat_s=1.5,
+                            )
                             if phase != "betting":
                                 last_phase = phase
                         self._emit()
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(0.2)
                         continue
+
+                    if self._kick_bet and self.betting_enabled:
+                        self._kick_bet = False
+                        last_phase = "kicked"
+                        self._log("Start bet clicked — will place on this/next betting window")
 
                     if phase == "betting" and last_phase != "betting":
                         if not self.betting_enabled:
                             self.site_message = (
                                 "Watching rounds (betting OFF). Click Start bet to play."
                             )
+                            self._log("betting window — betting OFF, skip", repeat_s=8)
                         elif self.engine.state.mode == Mode.RESTING:
                             self.engine.on_round_skipped()
                             self.site_message = self.engine.state.message
+                            self._log(self.site_message)
                         else:
                             nxt = self.engine.next_bet()
                             if nxt:
                                 bal = await self._read_balance(page)
                                 stake = nxt["stake"]
+                                self._log(
+                                    f"betting window — try stake={stake} cashout={nxt['cashout']} "
+                                    f"bal={bal} mode={self.engine.state.mode.value}"
+                                )
                                 if (
                                     self.engine.state.mode == Mode.RECOVERY
                                     and bal is not None
@@ -406,11 +476,13 @@ class CrashBot:
                                     )
                                     self.site_message = self.engine.state.message
                                     self.betting_enabled = False
+                                    self._log(self.site_message)
                                     self._emit()
                                 elif bal is not None and stake > bal + 1e-9:
                                     self.site_message = (
                                         f"Skip bet: stake {stake} > balance {bal}"
                                     )
+                                    self._log(self.site_message)
                                 else:
                                     hist = await self._read_latest_history_crash(page)
                                     ok = await self._place_bet(
@@ -423,6 +495,9 @@ class CrashBot:
                                             "hist_at_place": hist,
                                             "bal_at_place": bal,
                                             "peak_mult": 1.0,
+                                            "peak_ts": time.time(),
+                                            "saw_flying": False,
+                                            "max_below_cashout": 0.0,
                                         }
                                         tag = (
                                             "RECOVERY"
@@ -432,12 +507,17 @@ class CrashBot:
                                         self.site_message = (
                                             f"{tag} {stake} @ {nxt['cashout']}x placed"
                                         )
+                                        self._log(
+                                            f"{self.site_message} (hist_at_place={hist})"
+                                        )
                                     else:
                                         self.site_message = (
                                             "Could not fill/click bet — will retry next round"
                                         )
+                                        self._log(self.site_message)
                             else:
                                 self.site_message = self.engine.state.message
+                                self._log(f"next_bet empty: {self.site_message}")
 
                     last_phase = phase
                     self._emit()
@@ -464,32 +544,42 @@ class CrashBot:
     async def _settle_pending(
         self, page, pending_bet: dict[str, Any], phase: str | None = None
     ) -> bool:
-        """Settle win/lose from peak live mult + new history crash (never cashout field)."""
+        """Settle win/lose from peak live mult + history (handles instant 1.0x busts)."""
         cashout = float(pending_bet["cashout"])
         stake = float(pending_bet["stake"])
         placed_ts = float(pending_bet.get("placed_ts") or 0)
         hist_at_place = pending_bet.get("hist_at_place")
         bal_at_place = pending_bet.get("bal_at_place")
         peak = float(pending_bet.get("peak_mult") or 0.0)
+        peak_ts = float(pending_bet.get("peak_ts") or placed_ts)
+        saw_flying = bool(pending_bet.get("saw_flying"))
         age = time.time() - placed_ts
+        live = self.live_multiplier
+        peak_frozen = (time.time() - peak_ts) >= 0.65
 
         if phase is None:
-            phase = await self._detect_phase(page, self.live_multiplier)
+            phase = await self._detect_phase(page, live)
 
-        # Still in the round — only track peak, do not settle yet.
-        # Early settle with old history was resetting stake to base on real losses.
-        if phase == "flying" or (self.live_multiplier is not None and self.live_multiplier > 1.01):
-            if age < 30:
-                return False
+        # Mid-flight only when clearly climbing. Stuck 1.02x is NOT flying.
+        still_flying = live is not None and live > 1.12
+        if still_flying and age < 25:
+            self._log(f"settle wait: still flying live={live}", repeat_s=2)
+            return False
 
-        if age < 1.5:
+        # Countdown after placing — round has not started yet
+        if not saw_flying and phase == "betting" and age < 8.0:
+            self._log(f"settle wait: countdown (round not started) {age:.1f}s", repeat_s=2)
+            return False
+
+        if age < 0.6:
             return False
 
         hist = await self._read_latest_history_crash(page)
-        # Never treat the auto-cashout setting (e.g. 1.45) as the crash point
-        # unless live mult actually reached it — otherwise losses look like wins.
-        if hist is not None and abs(float(hist) - cashout) < 0.021 and peak + 1e-9 < cashout:
-            hist = None
+        # Ignore cashout setting masquerading as a history chip
+        if hist is not None and abs(float(hist) - cashout) < 0.021:
+            # Only keep it if we truly climbed past cashout
+            if peak + 1e-9 < cashout:
+                hist = None
 
         hist_changed = (
             hist is not None
@@ -501,20 +591,51 @@ class CrashBot:
         crash_at: float | None = None
         source = ""
 
-        # 1) Peak live multiplier crossed cashout → auto cashout win
-        if peak + 1e-9 >= cashout and phase in ("crashed", "betting", "unknown"):
+        # 1) History below cashout ALWAYS loses — beats peak/cashout ghosts
+        if hist_changed and hist is not None and float(hist) + 1e-9 < cashout:
+            won = False
+            crash_at = float(hist)
+            source = f"history-lose {crash_at}x"
+
+        # 2) History above cashout → win
+        elif hist_changed and hist is not None and float(hist) + 1e-9 >= cashout:
+            won = True
+            crash_at = float(hist)
+            source = f"history-win {crash_at}x"
+
+        # 3) Peak truly reached cashout (must have climbed toward it — not a lone 1.45 ghost)
+        elif peak + 1e-9 >= cashout and (
+            peak > cashout + 0.03
+            or float(pending_bet.get("max_below_cashout") or 0) >= cashout - 0.15
+        ):
             won = True
             crash_at = hist if hist_changed else peak
             source = f"peak {peak:.2f}x"
 
-        # 2) History chip actually changed after our bet
-        elif hist_changed and hist is not None:
-            crash_at = float(hist)
-            won = crash_at + 1e-9 >= cashout
-            source = f"history {crash_at}x"
+        # 4) Low bust (1.00–just under cashout): peak froze below cashout
+        elif (
+            saw_flying
+            and peak + 1e-9 < cashout
+            and peak_frozen
+            and (phase in ("crashed", "betting", "unknown") or age >= 1.2)
+        ):
+            won = False
+            crash_at = float(hist) if hist is not None else peak
+            source = f"fast-bust {crash_at}x"
 
-        # 3) Wallet delta (backup)
-        if won is None and bal_at_place is not None and age >= 2.5:
+        # 5) Flight done, never reached cashout, next betting window
+        elif (
+            saw_flying
+            and peak + 1e-9 < cashout
+            and phase == "betting"
+            and age >= 2.0
+        ):
+            won = False
+            crash_at = float(hist) if hist is not None else (peak if peak >= 1.0 else None)
+            source = f"bust-after-flight {crash_at if crash_at is not None else peak:.2f}x"
+
+        # 6) Wallet delta backup
+        if won is None and bal_at_place is not None and age >= 2.0:
             bal = await self._read_balance(page)
             if bal is not None:
                 delta = float(bal) - float(bal_at_place)
@@ -525,21 +646,26 @@ class CrashBot:
                     source = f"balance +{delta:.4f}"
                 elif delta <= -stake * 0.5:
                     won = False
-                    crash_at = hist if hist_changed else None
+                    crash_at = hist if hist is not None else None
                     source = f"balance {delta:.4f}"
 
         if won is None:
-            if age >= 20.0:
-                # Prefer lose only if we never saw cashout reached
-                if peak + 1e-9 >= cashout:
+            if age >= 12.0:
+                # Prefer lose when peak never clearly beat cashout
+                if peak + 1e-9 >= cashout and peak > cashout + 0.02:
                     won = True
                     crash_at = peak
                     source = "timeout-peak-win"
                 else:
                     won = False
-                    crash_at = hist
+                    crash_at = hist if hist is not None else (peak if peak >= 1.0 else None)
                     source = "timeout-lose"
             else:
+                self._log(
+                    f"settle wait: no result yet age={age:.1f}s phase={phase} "
+                    f"peak={peak} hist={hist} hist_chg={hist_changed} fly={saw_flying}",
+                    repeat_s=2,
+                )
                 return False
 
         self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
@@ -549,9 +675,7 @@ class CrashBot:
             if nxt and self.engine.state.mode != Mode.RESTING
             else self.engine.state.message
         )
-        self.site_message = (
-            f"{'Win' if won else 'Lose'} ({source}) | {nxt_txt}"
-        )
+        self.site_message = f"{'Win' if won else 'Lose'} ({source}) | {nxt_txt}"
         return True
 
     async def _first_locator(self, page, keys: list[str]):
@@ -619,6 +743,7 @@ class CrashBot:
             )
 
         if amount_loc is None or btn_loc is None:
+            self._log(f"place_bet fail: amount={amount_loc is not None} btn={btn_loc is not None}")
             return False
 
         try:
@@ -640,6 +765,7 @@ class CrashBot:
                         self.site_message = (
                             f"Amount mismatch: wanted {stake}, field shows {shown_val} — aborted"
                         )
+                        self._log(self.site_message)
                         return False
             except Exception:  # noqa: BLE001
                 pass
@@ -824,25 +950,31 @@ class CrashBot:
 
     async def _read_multiplier(self, page) -> float | None:
         """Live flying multiplier only — ignore cashout field (1.45) and history chips."""
+        cashout = float(self.engine.config.cashout)
         try:
             val = await page.evaluate(
-                """() => {
+                """(cashout) => {
                   const nodes = Array.from(document.querySelectorAll('div, span'));
                   let best = null;
                   for (const el of nodes) {
                     if (el.offsetParent === null) continue;
+                    if (el.closest('input,label,form,textarea')) continue;
                     const t = (el.innerText || '').trim();
                     if (!/^\\d+\\.\\d{2}x$/i.test(t)) continue;
                     const r = el.getBoundingClientRect();
-                    if (r.width < 40 || r.height < 20) continue;
+                    if (r.width < 48 || r.height < 28) continue;
                     if (r.top < 120) continue;
+                    if (r.left > window.innerWidth * 0.72) continue;
                     const v = parseFloat(t);
                     if (v < 1) continue;
                     const area = r.width * r.height;
+                    // Cashout setting is a small-ish label; live crash number is huge
+                    if (Math.abs(v - cashout) < 0.021 && area < 14000) continue;
                     if (!best || area > best.area) best = { v, area };
                   }
                   return best ? best.v : null;
-                }"""
+                }""",
+                cashout,
             )
             if isinstance(val, (int, float)) and val >= 1:
                 return float(val)
@@ -853,40 +985,36 @@ class CrashBot:
     async def _detect_phase(self, page, mult: float | None) -> str:
         """Detect round phase from UI. Prefer countdown / live mult over rare words."""
         try:
-            text = (await page.locator("body").inner_text()).lower()
-        except Exception:  # noqa: BLE001
-            text = ""
-
-        # Betting window signals (check before generic "crashed" — history can
-        # keep that word on screen and used to freeze the bot after bet 1).
-        if any(
-            k in text
-            for k in (
-                "starts in",
-                "place your bet",
-                "waiting for next",
-                "next round",
+            hint = await page.evaluate(
+                """() => {
+                  const t = (document.body && document.body.innerText || '').toLowerCase();
+                  if (/starts?\\s*in/.test(t) || t.includes('place your bet')
+                      || t.includes('waiting for next') || t.includes('next round')) {
+                    return 'betting';
+                  }
+                  if (/\\bcrashed\\b|\\bbusted\\b/.test(t) && !/starts?\\s*in/.test(t)) {
+                    return 'crashed';
+                  }
+                  return '';
+                }"""
             )
-        ):
-            return "betting"
-        if re.search(r"starts?\s*in\s*\d", text):
-            return "betting"
+        except Exception:  # noqa: BLE001
+            hint = ""
 
-        if mult is not None and mult > 1.01:
+        if hint == "betting":
+            return "betting"
+        if mult is not None and mult > 1.12:
             return "flying"
-
-        # Narrow crash signal: avoid matching every history chip forever
-        if re.search(r"\bcrashed\b|\bbusted\b", text) and not re.search(
-            r"starts?\s*in", text
-        ):
-            # If live mult is gone and no countdown, treat as crashed briefly
-            if mult is None or mult <= 1.01:
-                return "crashed"
-
-        if "place bet" in text or re.search(r"\bbet\b", text):
-            # Soft betting hint when button is available and not flying
-            if mult is None or mult <= 1.01:
-                return "betting"
+        if hint == "crashed":
+            return "crashed"
+        if mult is None or mult <= 1.12:
+            # Bet button is always on the page — only call it betting if no live climb
+            try:
+                btn = page.get_by_role("button", name=re.compile(r"^Bet$|^Main Bet|Bet \(Next Round\)", re.I))
+                if await btn.count() and await btn.first.is_visible():
+                    return "betting"
+            except Exception:  # noqa: BLE001
+                pass
         return "unknown"
 
     async def _result_hint(self, page) -> bool | None:
