@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from strategy import Mode, StrategyEngine
-from network_feed import CrashNetworkFeed
 
 ROOT = Path(__file__).resolve().parent
 PROFILE_DIR = ROOT / "browser_data"
@@ -64,7 +63,6 @@ class CrashBot:
         self.awaiting_login = False
         self.betting_enabled = False
         self._refresh_balance = False
-        self._feed = CrashNetworkFeed()
         self.live_multiplier: float | None = None
         self.site_message = "Browser not started"
 
@@ -82,7 +80,6 @@ class CrashBot:
                 "live_multiplier": self.live_multiplier,
                 "site_message": self.site_message,
                 "chrome_cdp": _cdp_alive(),
-                "feed": self._feed.snapshot(),
                 "config": self.engine.config.to_dict(),
             }
         )
@@ -158,7 +155,6 @@ class CrashBot:
         self.live_multiplier = None
         self.awaiting_login = False
         self.betting_enabled = False
-        self._feed = CrashNetworkFeed()
         self._login_ready.clear()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run_thread, daemon=True)
@@ -313,11 +309,9 @@ class CrashBot:
                     self._emit()
                     return
 
-                await self._attach_network_listeners(page)
-
                 self.betting_enabled = False
                 self.site_message = (
-                    "Browser connected — watching site + network. "
+                    "Browser connected — watching site. "
                     "Click Start bet under settings when ready."
                 )
                 self._emit()
@@ -361,26 +355,25 @@ class CrashBot:
                         await asyncio.sleep(1)
                         continue
 
-                    # Prefer network live mult; fall back to DOM
-                    snap = self._feed.snapshot()
-                    mult = snap.get("live_multiplier")
-                    if mult is None:
-                        mult = await self._read_multiplier(page)
+                    mult = await self._read_multiplier(page)
                     if mult is not None:
                         self.live_multiplier = mult
                         self.engine.state.last_multiplier_seen = mult
 
-                    phase = snap.get("phase_hint") or await self._detect_phase(page, mult)
-                    if phase not in ("betting", "flying", "crashed"):
-                        phase = await self._detect_phase(page, mult)
+                    phase = await self._detect_phase(page, mult)
 
-                    # Settle outstanding bet before placing another
+                    # Settle previous bet from DOM before opening another
                     if pending_bet is not None:
-                        settled = await self._settle_pending(page, pending_bet)
+                        settled = await self._settle_pending(page, pending_bet, phase)
                         if settled:
                             pending_bet = None
-                        # Do not open a new bet while one is pending
-                        last_phase = phase
+                            if phase == "betting":
+                                last_phase = "settled"
+                            else:
+                                last_phase = phase
+                        else:
+                            if phase != "betting":
+                                last_phase = phase
                         self._emit()
                         await asyncio.sleep(0.25)
                         continue
@@ -415,7 +408,7 @@ class CrashBot:
                                         f"Skip bet: stake {stake} > balance {bal}"
                                     )
                                 else:
-                                    crash_seq = self._feed.crash_seq
+                                    hist = await self._read_latest_history_crash(page)
                                     ok = await self._place_bet(
                                         page, stake, nxt["cashout"]
                                     )
@@ -423,7 +416,7 @@ class CrashBot:
                                         pending_bet = {
                                             **nxt,
                                             "placed_ts": time.time(),
-                                            "crash_seq": crash_seq,
+                                            "hist_at_place": hist,
                                         }
                                         tag = (
                                             "RECOVERY"
@@ -431,8 +424,7 @@ class CrashBot:
                                             else "Bet"
                                         )
                                         self.site_message = (
-                                            f"{tag} {stake} @ {nxt['cashout']}x "
-                                            f"(waiting network settle)"
+                                            f"{tag} {stake} @ {nxt['cashout']}x placed"
                                         )
                                     else:
                                         self.site_message = (
@@ -463,120 +455,65 @@ class CrashBot:
                     self.site_message = "Bot stopped — Chrome left open (session kept)"
             self._emit()
 
-    async def _attach_network_listeners(self, page) -> None:
-        """Hook Playwright websocket frames (+ CDP if available)."""
-        feed = self._feed
-
-        def _frame_to_text(payload: Any) -> Any:
-            if isinstance(payload, dict):
-                return payload.get("payloadData") or payload.get("payload") or payload
-            return payload
-
-        def on_ws(ws) -> None:
-            try:
-                ws.on("framereceived", lambda payload: feed.handle_frame(_frame_to_text(payload)))
-                ws.on("framesent", lambda payload: feed.handle_frame(_frame_to_text(payload)))
-            except Exception:  # noqa: BLE001
-                pass
-
-        try:
-            page.on("websocket", on_ws)
-        except Exception:  # noqa: BLE001
-            pass
-
-        # Also attach to already-open sockets via CDP Network events
-        try:
-            cdp = await page.context.new_cdp_session(page)
-            await cdp.send("Network.enable")
-
-            def _on_ws_frame(params: dict) -> None:
-                try:
-                    resp = params.get("response") or {}
-                    payload = resp.get("payloadData")
-                    if payload:
-                        feed.handle_frame(payload)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            cdp.on("Network.webSocketFrameReceived", _on_ws_frame)
-            cdp.on("Network.webSocketFrameSent", _on_ws_frame)
-            self.site_message = "Network listeners attached (WebSocket)"
-            self._emit()
-        except Exception as exc:  # noqa: BLE001
-            self.site_message = f"WS hook limited ({exc}); using page websockets + DOM fallback"
-
-    async def _settle_pending(self, page, pending_bet: dict[str, Any]) -> bool:
-        """Settle using network outcome/crash first, then careful DOM fallback."""
+    async def _settle_pending(
+        self, page, pending_bet: dict[str, Any], phase: str | None = None
+    ) -> bool:
+        """Settle from DOM history / crash text only (no network listeners)."""
         cashout = float(pending_bet["cashout"])
         stake = float(pending_bet["stake"])
         placed_ts = float(pending_bet.get("placed_ts") or 0)
-        min_seq = int(pending_bet.get("crash_seq") or 0)
+        hist_at_place = pending_bet.get("hist_at_place")
+        age = time.time() - placed_ts
 
-        # 1) Explicit bet outcome from network
-        outcome = self._feed.pop_outcome_since(placed_ts)
-        if outcome is not None:
-            crash_at = outcome.crash_at
-            if crash_at is None and self._feed.crash_seq > min_seq:
-                crash_at = self._feed.last_crash
-            won = outcome.won
-            # If outcome says won but crash known and below cashout, trust crash
-            if crash_at is not None:
-                won = crash_at + 1e-9 >= cashout
-            self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
-            self.site_message = (
-                f"{'Win' if won else 'Lose'} via {outcome.source} "
-                f"crash={crash_at if crash_at is not None else '?'}x | "
-                f"{self.engine.state.message}"
-            )
-            return True
+        if phase is None:
+            phase = await self._detect_phase(page, self.live_multiplier)
 
-        # 2) New crash point from network after we placed
-        if self._feed.crash_seq > min_seq and self._feed.last_crash is not None:
-            crash_at = float(self._feed.last_crash)
+        # Wait until round looks finished or next betting window
+        if age < 1.2 and phase == "flying":
+            return False
+
+        crash_at = None
+        if phase in ("crashed", "betting", "unknown") or age >= 4.0:
+            crash_at = await self._read_latest_history_crash(page)
+            if crash_at is None:
+                crash_at = await self._read_crashed_at_text(page)
+            # Ignore unchanged history chip for a bit (still old round)
+            if (
+                crash_at is not None
+                and hist_at_place is not None
+                and abs(float(crash_at) - float(hist_at_place)) < 1e-9
+                and age < 8.0
+                and phase != "crashed"
+            ):
+                crash_at = None
+
+        if crash_at is not None:
             won = crash_at + 1e-9 >= cashout
+            # Soft check: UI win/lose hint can override ambiguous equal-cashout
+            hint = await self._result_hint(page)
+            if hint is not None and abs(crash_at - cashout) < 0.02:
+                won = hint
             self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
             self.site_message = (
-                f"{'Win' if won else 'Lose'} via network crash {crash_at}x "
+                f"{'Win' if won else 'Lose'} {crash_at}x "
                 f"(cashout {cashout}x) | {self.engine.state.message}"
             )
             return True
 
-        # 3) DOM fallback only after crashed phase + new history chip
-        phase = await self._detect_phase(page, self.live_multiplier)
-        feed_phase = self._feed.phase_hint
-        if phase == "crashed" or feed_phase == "crashed":
-            # Wait a moment for history chip update
-            if time.time() - placed_ts < 1.0:
-                return False
-            crash_at = await self._read_latest_history_crash(page)
-            if crash_at is None:
-                crash_at = await self._read_crashed_at_text(page)
-            # Reject cashout-looking ghosts: if crash == cashout exactly, prefer lose only
-            # when history is clearly below — if equal, treat as win (auto cashout hit)
-            if crash_at is not None:
-                # Ignore if this crash was already used
-                if pending_bet.get("dom_crash") == crash_at:
-                    return False
-                # Require crash to look like a real bust point: either clearly above cashout
-                # (win) or clearly below (lose). Equal → win (cashed out).
-                won = crash_at + 1e-9 >= cashout
-                pending_bet["dom_crash"] = crash_at
-                self._feed.note_crash(crash_at, source="dom-history")
-                self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
-                self.site_message = (
-                    f"{'Win' if won else 'Lose'} via DOM history {crash_at}x "
-                    f"(cashout {cashout}x) | {self.engine.state.message}"
-                )
-                return True
+        hint = await self._result_hint(page)
+        if hint is not None and age >= 2.0:
+            self.engine.on_bet_result(won=hint, stake=stake, crash_at=None)
+            self.site_message = (
+                f"{'Win' if hint else 'Lose'} via UI text | {self.engine.state.message}"
+            )
+            return True
 
-            # Last resort after long wait: if still no crash, don't invent a win
-            if time.time() - placed_ts > 12:
-                self.engine.on_bet_result(won=False, stake=stake, crash_at=None)
-                self.site_message = (
-                    "Settle timeout — counted as LOSE (no crash data). "
-                    f"{self.engine.state.message}"
-                )
-                return True
+        if age >= 18.0:
+            self.engine.on_bet_result(won=False, stake=stake, crash_at=None)
+            self.site_message = (
+                f"Settle timeout — counted LOSE | {self.engine.state.message}"
+            )
+            return True
 
         return False
 
@@ -878,19 +815,42 @@ class CrashBot:
         return None
 
     async def _detect_phase(self, page, mult: float | None) -> str:
+        """Detect round phase from UI. Prefer countdown / live mult over rare words."""
         try:
             text = (await page.locator("body").inner_text()).lower()
         except Exception:  # noqa: BLE001
             text = ""
 
-        if "crashed" in text or "bust" in text:
-            return "crashed"
-        if any(k in text for k in ("place your bet", "betting", "waiting for next", "starts in")):
+        # Betting window signals (check before generic "crashed" — history can
+        # keep that word on screen and used to freeze the bot after bet 1).
+        if any(
+            k in text
+            for k in (
+                "starts in",
+                "place your bet",
+                "waiting for next",
+                "next round",
+            )
+        ):
             return "betting"
+        if re.search(r"starts?\s*in\s*\d", text):
+            return "betting"
+
         if mult is not None and mult > 1.01:
             return "flying"
-        if "bet" in text:
-            return "betting"
+
+        # Narrow crash signal: avoid matching every history chip forever
+        if re.search(r"\bcrashed\b|\bbusted\b", text) and not re.search(
+            r"starts?\s*in", text
+        ):
+            # If live mult is gone and no countdown, treat as crashed briefly
+            if mult is None or mult <= 1.01:
+                return "crashed"
+
+        if "place bet" in text or re.search(r"\bbet\b", text):
+            # Soft betting hint when button is available and not flying
+            if mult is None or mult <= 1.01:
+                return "betting"
         return "unknown"
 
     async def _result_hint(self, page) -> bool | None:
