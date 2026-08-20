@@ -5,10 +5,18 @@
   "losses_before_rest": 4,
   "rest_rounds": 10,
   "recovery_attempts": 2,
-  "stop_loss": 50,
-  "site_url": "https://bc.game/game/crash",
+  "stop_loss": 50.0,
+  "start_balance": 0.0,
+  "site_url": "https://bcmail2.com/game/crash",
   "headless": false,
   "selectors": {
+    "balance": [
+      "[data-testid='balance']",
+      ".balance-amount",
+      ".wallet-balance",
+      "[class*='balance' i]",
+      "header [class*='Balance']"
+    ],
     "bet_amount": [
       "input[data-testid='bet-amount']",
       "input[placeholder*='Amount' i]",

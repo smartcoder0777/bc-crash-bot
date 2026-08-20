@@ -3,16 +3,34 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>BC Crash Bot</title>
+  <title>Dashboard</title>
   <link rel="stylesheet" href="/static/style.css" />
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
 <body>
   <div class="wrap">
-    <header>
-      <h1>BC Crash Bot</h1>
-      <p class="sub">Live site numbers + editable strategy</p>
-    </header>
+    <section class="totals">
+      <div class="metric">
+        <span class="label">Start balance</span>
+        <span id="startBalance" class="value">0.0000</span>
+      </div>
+      <div class="metric">
+        <span class="label">Current balance</span>
+        <span id="currentBalance" class="value">0.0000</span>
+      </div>
+      <div class="metric">
+        <span class="label">Total won</span>
+        <span id="totalWon" class="value win">0.0000</span>
+      </div>
+      <div class="metric">
+        <span class="label">Total lost</span>
+        <span id="totalLost" class="value lose">0.0000</span>
+      </div>
+      <div class="metric">
+        <span class="label">Net P/L</span>
+        <span id="pnl" class="value">0.0000</span>
+      </div>
+    </section>
 
     <section class="live">
       <div class="metric big">
@@ -28,8 +46,8 @@
         <span id="stake" class="value">—</span>
       </div>
       <div class="metric">
-        <span class="label">Session P/L</span>
-        <span id="pnl" class="value">0</span>
+        <span class="label">Wins / Losses</span>
+        <span id="wlTop" class="value">0 / 0</span>
       </div>
     </section>
 
@@ -53,7 +71,7 @@
           <button id="btnStop">Stop</button>
           <button id="btnReset">Reset strategy</button>
         </div>
-        <p class="hint">Start opens Chromium → log into BC.Game → open Crash. Bot auto-fills stake + 1.45x and clicks Bet.</p>
+        <p class="hint">Start opens Chrome with a saved login profile. Log in once; next starts stay logged in. Bot auto-fills stake + cashout and clicks Bet.</p>
       </div>
 
       <div class="card">
@@ -74,10 +92,17 @@
     </section>
 
     <section class="card">
-      <h2>Recent bets</h2>
+      <div class="history-head">
+        <h2>Recent bets</h2>
+        <div class="pager">
+          <button type="button" id="prevPage">Prev</button>
+          <span id="pageInfo">Page 1 / 1</span>
+          <button type="button" id="nextPage">Next</button>
+        </div>
+      </div>
       <table>
         <thead>
-          <tr><th>Result</th><th>Stake</th><th>Profit</th><th>Crash</th></tr>
+          <tr><th>#</th><th>Result</th><th>Stake</th><th>Profit</th><th>Crash</th></tr>
         </thead>
         <tbody id="history"></tbody>
       </table>

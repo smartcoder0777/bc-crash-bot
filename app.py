@@ -78,8 +78,10 @@ def api_set_config():
     global full_config
     data = request.get_json(force=True) or {}
     # Keep non-strategy keys (selectors, url, headless)
-    strategy_keys = set(StrategyConfig().to_dict().keys())
-    for k, v in data.items():
+    # start_balance is read from the site when the bot starts — not editable
+    strategy_keys = set(StrategyConfig().to_dict().keys()) - {"start_balance"}
+    data.pop("start_balance", None)
+    for k, v in list(data.items()):
         if k in strategy_keys:
             try:
                 data[k] = float(v) if k not in {
@@ -90,19 +92,25 @@ def api_set_config():
             except (TypeError, ValueError):
                 return jsonify({"ok": False, "error": f"Invalid value for {k}"}), 400
 
+    # Preserve existing start_balance
     merged = {**full_config, **{k: data[k] for k in data if k in strategy_keys or k in full_config}}
+    merged["start_balance"] = full_config.get(
+        "start_balance", engine.config.start_balance
+    )
     # Also allow updating site_url / headless from dashboard if sent
     for extra in ("site_url", "headless"):
         if extra in data:
             merged[extra] = data[extra]
 
     engine.update_config(merged)
+    # Keep site-captured start balance on engine
+    engine.config.start_balance = float(merged.get("start_balance", 0) or 0)
     bot.config = merged
     full_config = merged
     save_config(merged)
     emit_status()
     return jsonify({"ok": True, "config": {
-        **engine.config.to_dict(),
+        **{k: v for k, v in engine.config.to_dict().items() if k != "start_balance"},
         "site_url": full_config.get("site_url", ""),
     }})
 

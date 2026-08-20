@@ -1,6 +1,10 @@
 const socket = io();
+const PAGE_SIZE = 100;
 
 const el = (id) => document.getElementById(id);
+
+let historyCache = [];
+let page = 1;
 
 function fillForm(cfg) {
   const form = el("cfgForm");
@@ -10,6 +14,40 @@ function fillForm(cfg) {
   if (cfg.site_url && form.elements.site_url) {
     form.elements.site_url.value = cfg.site_url;
   }
+}
+
+function totalPages() {
+  return Math.max(1, Math.ceil(historyCache.length / PAGE_SIZE));
+}
+
+function renderHistoryPage() {
+  const pages = totalPages();
+  if (page > pages) page = pages;
+  if (page < 1) page = 1;
+
+  const newestFirst = historyCache.slice().reverse();
+  const start = (page - 1) * PAGE_SIZE;
+  const slice = newestFirst.slice(start, start + PAGE_SIZE);
+
+  const tbody = el("history");
+  tbody.innerHTML = "";
+  slice.forEach((h, i) => {
+    const roundNo = historyCache.length - start - i;
+    const tr = document.createElement("tr");
+    tr.className = h.result === "win" ? "row-win" : "row-lose";
+    const profitClass = h.result === "win" ? "win" : "lose";
+    tr.innerHTML = `
+      <td>${roundNo}</td>
+      <td class="${profitClass}">${h.result}</td>
+      <td>${h.stake}</td>
+      <td class="${profitClass}">${h.profit}</td>
+      <td>${h.crash != null ? h.crash : "—"}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  el("pageInfo").textContent = `Page ${page} / ${pages} (${historyCache.length} rounds)`;
+  el("prevPage").disabled = page <= 1;
+  el("nextPage").disabled = page >= pages;
 }
 
 function render(s, { syncForm = false } = {}) {
@@ -24,10 +62,23 @@ function render(s, { syncForm = false } = {}) {
     mode === "recovery"
       ? String(s.recovery_stake)
       : String(s.current_stake);
-  const pnl = Number(s.session_pnl || 0);
-  el("pnl").textContent = pnl.toFixed(4);
-  el("pnl").className = `value ${pnl >= 0 ? "pnl-pos" : "pnl-neg"}`;
 
+  const won = Number(s.total_won || 0);
+  const lost = Number(s.total_lost || 0);
+  const pnl = Number(s.session_pnl || 0);
+  const startBal = Number(s.start_balance || 0);
+  const curBal = Number(
+    s.current_balance != null ? s.current_balance : startBal + pnl
+  );
+  el("startBalance").textContent = startBal.toFixed(4);
+  el("currentBalance").textContent = curBal.toFixed(4);
+  el("currentBalance").className = `value ${curBal >= startBal ? "win" : "lose"}`;
+  el("totalWon").textContent = won.toFixed(4);
+  el("totalLost").textContent = lost.toFixed(4);
+  el("pnl").textContent = pnl.toFixed(4);
+  el("pnl").className = `value ${pnl >= 0 ? "win" : "lose"}`;
+
+  el("wlTop").textContent = `${s.wins ?? 0} / ${s.losses ?? 0}`;
   el("botRunning").textContent = s.bot_running ? "RUNNING" : "off";
   el("message").textContent = s.message || "—";
   el("siteMessage").textContent = s.site_message || "—";
@@ -36,24 +87,28 @@ function render(s, { syncForm = false } = {}) {
   el("recLeft").textContent = s.recovery_left ?? 0;
   el("wl").textContent = `${s.wins ?? 0} / ${s.losses ?? 0}`;
   el("bets").textContent = s.bets_placed ?? 0;
-  el("lastResult").textContent = s.last_result || "—";
+
+  const last = s.last_result || "—";
+  el("lastResult").textContent = last;
+  el("lastResult").className = last === "win" ? "win" : last === "lose" ? "lose" : "";
+
   el("lastCrash").textContent =
     s.last_crash != null ? `${Number(s.last_crash).toFixed(2)}x` : "—";
 
-  const tbody = el("history");
-  tbody.innerHTML = "";
-  (s.history || []).slice().reverse().forEach((h) => {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td class="${h.result}">${h.result}</td>
-      <td>${h.stake}</td>
-      <td class="${h.profit >= 0 ? "win" : "lose"}">${h.profit}</td>
-      <td>${h.crash != null ? h.crash : "—"}</td>`;
-    tbody.appendChild(tr);
-  });
+  historyCache = s.history || [];
+  renderHistoryPage();
 
   if (syncForm && s.config) fillForm(s.config);
 }
+
+el("prevPage").onclick = () => {
+  page -= 1;
+  renderHistoryPage();
+};
+el("nextPage").onclick = () => {
+  page += 1;
+  renderHistoryPage();
+};
 
 socket.on("status", (s) => render(s));
 socket.on("connect", () => socket.emit("request_status"));
@@ -75,6 +130,7 @@ el("btnStop").onclick = async () => {
   await fetch("/api/stop", { method: "POST" });
 };
 el("btnReset").onclick = async () => {
+  page = 1;
   const r = await fetch("/api/reset", { method: "POST" });
   const data = await r.json();
   if (data.status) render(data.status);

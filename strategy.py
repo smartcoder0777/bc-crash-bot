@@ -23,6 +23,7 @@ class StrategyConfig:
     rest_rounds: int = 10
     recovery_attempts: int = 2
     stop_loss: float = 50.0
+    start_balance: float = 0.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StrategyConfig":
@@ -43,6 +44,8 @@ class StrategyState:
     recovery_stake: float = 0.0
     last_lost_amount: float = 0.0
     session_pnl: float = 0.0
+    total_won: float = 0.0
+    total_lost: float = 0.0
     bets_placed: int = 0
     wins: int = 0
     losses: int = 0
@@ -62,6 +65,8 @@ class StrategyState:
             "recovery_stake": round(self.recovery_stake, 8),
             "last_lost_amount": round(self.last_lost_amount, 8),
             "session_pnl": round(self.session_pnl, 8),
+            "total_won": round(self.total_won, 8),
+            "total_lost": round(self.total_lost, 8),
             "bets_placed": self.bets_placed,
             "wins": self.wins,
             "losses": self.losses,
@@ -69,7 +74,7 @@ class StrategyState:
             "last_crash": self.last_crash,
             "last_multiplier_seen": self.last_multiplier_seen,
             "message": self.message,
-            "history": self.history[-30:],
+            "history": list(self.history),
         }
 
 
@@ -77,6 +82,18 @@ class StrategyEngine:
     def __init__(self, config: StrategyConfig):
         self.config = config
         self.state = StrategyState(current_stake=config.base_stake)
+
+    def snapshot(self) -> dict[str, Any]:
+        data = self.state.snapshot()
+        start = float(self.config.start_balance)
+        data["start_balance"] = round(start, 8)
+        data["current_balance"] = round(start + self.state.session_pnl, 8)
+        return data
+
+    def set_start_balance(self, amount: float) -> None:
+        self.config.start_balance = float(amount)
+        if amount > 0:
+            self.state.message = f"Start balance from site: {amount}"
 
     def update_config(self, data: dict[str, Any]) -> None:
         self.config = StrategyConfig.from_dict({**self.config.to_dict(), **data})
@@ -136,6 +153,7 @@ class StrategyEngine:
         if won:
             profit = stake * (cfg.cashout - 1.0)
             st.session_pnl += profit
+            st.total_won += profit
             st.wins += 1
             st.last_result = "win"
             st.history.append(
@@ -149,6 +167,7 @@ class StrategyEngine:
             st.message = f"Win +{profit:.4f} → reset to base {cfg.base_stake}"
         else:
             st.session_pnl -= stake
+            st.total_lost += stake
             st.losses += 1
             st.last_result = "lose"
             st.last_lost_amount = stake

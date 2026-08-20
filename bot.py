@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
-import time
+from pathlib import Path
 from typing import Any, Callable
 
 from strategy import Mode, StrategyEngine
 
+ROOT = Path(__file__).resolve().parent
+PROFILE_DIR = ROOT / "browser_data"
 
 StatusCallback = Callable[[dict[str, Any]], None]
 
@@ -27,7 +29,7 @@ class CrashBot:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._running = False
-        self._browser = None
+        self._context = None
         self._page = None
         self._playwright = None
         self.live_multiplier: float | None = None
@@ -38,7 +40,7 @@ class CrashBot:
         return self._running
 
     def status(self) -> dict[str, Any]:
-        data = self.engine.state.snapshot()
+        data = self.engine.snapshot()
         data.update(
             {
                 "bot_running": self._running,
@@ -55,6 +57,9 @@ class CrashBot:
     def start(self) -> None:
         if self._running:
             return
+        # Fresh session: start balance will be read from site
+        self.engine.config.start_balance = 0.0
+        self.config["start_balance"] = 0.0
         self._stop.clear()
         self._thread = threading.Thread(target=self._run_thread, daemon=True)
         self._thread.start()
@@ -78,46 +83,77 @@ class CrashBot:
         try:
             async with async_playwright() as p:
                 self._playwright = p
-                launch_args = {
+                PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+                launch_kwargs = {
+                    "user_data_dir": str(PROFILE_DIR),
                     "headless": bool(self.config.get("headless", False)),
                     "args": ["--start-maximized"],
+                    "no_viewport": True,
                 }
-                # Prefer installed Google Chrome (no Playwright browser download needed)
+                # Persistent profile keeps BC.Game login across bot restarts
                 try:
-                    self._browser = await p.chromium.launch(
-                        channel="chrome", **launch_args
+                    context = await p.chromium.launch_persistent_context(
+                        channel="chrome", **launch_kwargs
                     )
                 except Exception:
-                    self._browser = await p.chromium.launch(**launch_args)
-                context = await self._browser.new_context(no_viewport=True)
-                page = await context.new_page()
+                    context = await p.chromium.launch_persistent_context(**launch_kwargs)
+
+                self._context = context
+                page = context.pages[0] if context.pages else await context.new_page()
                 self._page = page
 
                 url = self.config.get("site_url", "https://bc.game/game/crash")
                 await page.goto(url, wait_until="domcontentloaded")
                 self.site_message = (
-                    "Browser open — log in on the site, open Crash, then bot will auto-fill."
+                    "Browser open (saved session). "
+                    "Log in once if needed — waiting to read balance…"
                 )
                 self._emit()
 
-                # Give user time to log in / open game
+                # Wait until site balance is readable (user logs in)
                 login_wait = 0
-                while not self._stop.is_set() and login_wait < 120:
+                balance_captured = False
+                while not self._stop.is_set() and login_wait < 180:
+                    bal = await self._read_balance(page)
+                    if bal is not None and bal > 0:
+                        self.engine.set_start_balance(bal)
+                        # Persist for display after restart of process only via memory;
+                        # also update runtime config dict
+                        self.config["start_balance"] = bal
+                        balance_captured = True
+                        self.site_message = f"Start balance from site: {bal}"
+                        self._emit()
+                        break
                     await asyncio.sleep(1)
                     login_wait += 1
                     if login_wait % 5 == 0:
                         self.site_message = (
-                            f"Waiting for you to log in / open Crash… ({login_wait}s)"
+                            f"Waiting for login / balance on site… ({login_wait}s)"
                         )
                         self._emit()
 
-                self.site_message = "Bot loop started — watching rounds"
-                self._emit()
+                if not balance_captured and not self._stop.is_set():
+                    self.site_message = (
+                        "Could not read balance yet — continuing; will retry in loop"
+                    )
+                    self._emit()
+                elif not self._stop.is_set():
+                    self.site_message = "Bot loop started — watching rounds"
+                    self._emit()
 
                 last_phase = "unknown"
                 pending_bet: dict[str, float] | None = None
 
                 while not self._stop.is_set():
+                    if not balance_captured:
+                        bal = await self._read_balance(page)
+                        if bal is not None and bal > 0:
+                            self.engine.set_start_balance(bal)
+                            self.config["start_balance"] = bal
+                            balance_captured = True
+                            self.site_message = f"Start balance from site: {bal}"
+                            self._emit()
                     if self.engine.state.mode == Mode.STOPPED:
                         self.site_message = self.engine.state.message
                         self._emit()
@@ -181,16 +217,15 @@ class CrashBot:
                     await asyncio.sleep(0.35)
 
                 await context.close()
-                await self._browser.close()
         except Exception as exc:  # noqa: BLE001
             self.site_message = f"Bot error: {exc}"
             self._emit()
         finally:
             self._running = False
             self._page = None
-            self._browser = None
+            self._context = None
             if not self.site_message.startswith("Bot error"):
-                self.site_message = "Bot stopped"
+                self.site_message = "Bot stopped (login session saved)"
             self._emit()
 
     async def _first_locator(self, page, keys: list[str]):
@@ -239,6 +274,63 @@ class CrashBot:
     def _fmt(value: float) -> str:
         text = f"{value:.8f}".rstrip("0").rstrip(".")
         return text if text else "0"
+
+    async def _read_balance(self, page) -> float | None:
+        """Read wallet/balance amount shown on BC.Game."""
+        selectors = self.config.get("selectors", {}).get("balance", [])
+        candidates: list[float] = []
+
+        for sel in selectors:
+            loc = page.locator(sel)
+            try:
+                n = await loc.count()
+            except Exception:  # noqa: BLE001
+                continue
+            for i in range(min(n, 8)):
+                try:
+                    node = loc.nth(i)
+                    if not await node.is_visible():
+                        continue
+                    text = (await node.inner_text()).strip()
+                    val = self._parse_money(text)
+                    if val is not None:
+                        candidates.append(val)
+                except Exception:  # noqa: BLE001
+                    continue
+
+        if not candidates:
+            # Fallback: header-like money amounts (avoid tiny 0.00 noise if possible)
+            try:
+                header = page.locator("header").first
+                text = await header.inner_text() if await header.count() else ""
+                for m in re.finditer(
+                    r"(?<![\d.])(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)\s*(?:USDT|USD|BTC|ETH|SOL)?",
+                    text,
+                    flags=re.I,
+                ):
+                    val = self._parse_money(m.group(1))
+                    if val is not None and val > 0:
+                        candidates.append(val)
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not candidates:
+            return None
+        # Prefer the largest plausible wallet figure in view
+        return max(candidates)
+
+    @staticmethod
+    def _parse_money(text: str) -> float | None:
+        if not text:
+            return None
+        cleaned = text.replace(",", "").replace("\u00a0", " ").strip()
+        m = re.search(r"(\d+(?:\.\d+)?)", cleaned)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
 
     async def _read_multiplier(self, page) -> float | None:
         selectors = self.config.get("selectors", {}).get("multiplier", [])

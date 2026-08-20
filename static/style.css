@@ -28,6 +28,13 @@ header h1 { margin: 0; font-size: 1.6rem; letter-spacing: 0.02em; }
   gap: 12px;
   margin-bottom: 16px;
 }
+.totals {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.totals .value { font-size: 1.5rem; font-weight: 600; }
 .metric {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -114,15 +121,34 @@ form button { grid-column: 1 / -1; margin-top: 4px; }
 table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
 th { color: var(--muted); font-weight: 500; }
-.win { color: var(--accent); }
-.lose { color: var(--danger); }
-.pnl-pos { color: var(--accent); }
-.pnl-neg { color: var(--danger); }
+.win { color: #22c55e !important; }
+.lose { color: #ef4444 !important; }
+.pnl-pos { color: #22c55e; }
+.pnl-neg { color: #ef4444; }
+tr.row-win td { color: #22c55e; }
+tr.row-lose td { color: #ef4444; }
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.history-head h2 { margin: 0; }
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.pager button:disabled { opacity: 0.4; cursor: default; }
 
 @media (max-width: 860px) {
-  .live, .grid, form { grid-template-columns: 1fr 1fr; }
+  .live, .grid, .totals, form { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 560px) {
-  .live, .grid, form { grid-template-columns: 1fr; }
+  .live, .grid, .totals, form { grid-template-columns: 1fr; }
   dl > div { grid-template-columns: 1fr; }
+  .history-head { flex-direction: column; align-items: flex-start; }
 }
