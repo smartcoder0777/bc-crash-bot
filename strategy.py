@@ -101,9 +101,10 @@ class StrategyEngine:
             self.state.current_stake = self.config.base_stake
 
     def reset(self) -> None:
+        self.config.start_balance = 0.0
         self.state = StrategyState(
             current_stake=self.config.base_stake,
-            message="Reset to base stake",
+            message="Reset — all session values cleared",
         )
 
     def should_bet(self) -> bool:

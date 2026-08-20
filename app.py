@@ -150,9 +150,15 @@ def api_stop():
 
 @app.post("/api/reset")
 def api_reset():
+    global full_config
     engine.reset()
+    full_config["start_balance"] = 0.0
+    bot.config["start_balance"] = 0.0
+    bot.betting_enabled = False
+    bot.request_balance_refresh()
     emit_status()
-    return jsonify({"ok": True, "status": bot.status()})
+    data = bot.status()
+    return jsonify({"ok": True, "status": data})
 
 
 @socketio.on("connect")

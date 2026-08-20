@@ -62,6 +62,7 @@ class CrashBot:
         self._login_ready = threading.Event()
         self.awaiting_login = False
         self.betting_enabled = False
+        self._refresh_balance = False
         self.live_multiplier: float | None = None
         self.site_message = "Browser not started"
 
@@ -172,6 +173,10 @@ class CrashBot:
         self.site_message = "Betting OFF — browser still connected, watching only"
         self._emit()
         return {"ok": True}
+
+    def request_balance_refresh(self) -> None:
+        """After strategy reset: re-read wallet when browser is connected."""
+        self._refresh_balance = True
 
     def confirm_login(self) -> None:
         self._login_ready.set()
@@ -315,6 +320,19 @@ class CrashBot:
                 pending_bet: dict[str, float] | None = None
 
                 while not self._stop.is_set():
+                    if self._refresh_balance:
+                        self._refresh_balance = False
+                        bal = await self._read_balance(page)
+                        if bal is not None and bal >= 0:
+                            self.engine.set_start_balance(bal)
+                            self.config["start_balance"] = bal
+                            self.site_message = f"Reset done. Start balance from site: {bal}"
+                        else:
+                            self.site_message = (
+                                "Reset done. Start/current cleared (could not re-read wallet)."
+                            )
+                        self._emit()
+
                     if await self._login_modal_open(page):
                         pending_bet = None
                         self.betting_enabled = False
