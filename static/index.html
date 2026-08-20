@@ -56,6 +56,7 @@
         <h2>Status</h2>
         <dl>
           <div><dt>Bot</dt><dd id="botRunning">off</dd></div>
+          <div><dt>Betting</dt><dd id="bettingState">off</dd></div>
           <div><dt>Message</dt><dd id="message">—</dd></div>
           <div><dt>Site</dt><dd id="siteMessage">—</dd></div>
           <div><dt>Consecutive losses</dt><dd id="lossesStreak">0</dd></div>
@@ -67,11 +68,13 @@
           <div><dt>Last crash</dt><dd id="lastCrash">—</dd></div>
         </dl>
         <div class="actions">
+          <button id="btnLoginChrome" class="primary">Open Chrome to log in</button>
           <button id="btnStart" class="primary">Start browser bot</button>
-          <button id="btnStop">Stop</button>
+          <button id="btnContinue" class="primary" disabled>I'm logged in — continue</button>
+          <button id="btnStop" class="danger">Stop browser</button>
           <button id="btnReset">Reset strategy</button>
         </div>
-        <p class="hint">Start opens Chrome with a saved login profile. Log in once; next starts stay logged in. Bot auto-fills stake + cashout and clicks Bet.</p>
+        <p class="hint">1) Open Chrome &amp; log in. 2) Keep Chrome open. 3) Start browser bot (connect). 4) Use <b>Start bet / Stop bet</b> under settings to place bets.</p>
       </div>
 
       <div class="card">
@@ -87,6 +90,10 @@
           <label>Site URL <input name="site_url" type="text" /></label>
           <button type="submit" class="primary">Save settings</button>
         </form>
+        <div class="bet-actions">
+          <button type="button" id="btnStartBet" class="bet-on">Start bet</button>
+          <button type="button" id="btnStopBet" class="bet-off">Stop bet</button>
+        </div>
         <p id="saveMsg" class="hint"></p>
       </div>
     </section>

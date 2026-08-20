@@ -1,10 +1,14 @@
-"""Playwright controller: open BC.Game Crash, auto-fill stake/cashout, place bets."""
+"""Control BC Crash via real Chrome (CDP). Never launches Playwright's automated browser."""
 
 from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
 import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,8 +16,30 @@ from strategy import Mode, StrategyEngine
 
 ROOT = Path(__file__).resolve().parent
 PROFILE_DIR = ROOT / "browser_data"
+CDP_PORT = 9222
+CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 
 StatusCallback = Callable[[dict[str, Any]], None]
+
+
+def _chrome_path() -> str | None:
+    candidates = [
+        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+        Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def _cdp_alive() -> bool:
+    try:
+        with urllib.request.urlopen(f"{CDP_URL}/json/version", timeout=1.5) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
 
 
 class CrashBot:
@@ -31,7 +57,11 @@ class CrashBot:
         self._running = False
         self._context = None
         self._page = None
-        self._playwright = None
+        self._browser = None
+        self._chrome_proc: subprocess.Popen | None = None
+        self._login_ready = threading.Event()
+        self.awaiting_login = False
+        self.betting_enabled = False
         self.live_multiplier: float | None = None
         self.site_message = "Browser not started"
 
@@ -44,8 +74,11 @@ class CrashBot:
         data.update(
             {
                 "bot_running": self._running,
+                "awaiting_login": self.awaiting_login,
+                "betting_enabled": self.betting_enabled,
                 "live_multiplier": self.live_multiplier,
                 "site_message": self.site_message,
+                "chrome_cdp": _cdp_alive(),
                 "config": self.engine.config.to_dict(),
             }
         )
@@ -54,20 +87,104 @@ class CrashBot:
     def _emit(self) -> None:
         self.on_status(self.status())
 
+    def ensure_real_chrome(self) -> dict[str, Any]:
+        """Start real Google Chrome with remote debugging (same window for login + bot)."""
+        if _cdp_alive():
+            self.site_message = (
+                "Real Chrome already running. Log in there if needed, then Start bot "
+                "(keep this Chrome open)."
+            )
+            self._emit()
+            return {"ok": True, "already": True}
+
+        chrome = _chrome_path()
+        if not chrome:
+            return {"ok": False, "error": "Google Chrome not found."}
+
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        url = self.config.get("site_url", "https://bc.game/game/crash")
+        try:
+            self._chrome_proc = subprocess.Popen(
+                [
+                    chrome,
+                    f"--remote-debugging-port={CDP_PORT}",
+                    f"--user-data-dir={PROFILE_DIR}",
+                    "--profile-directory=Default",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--start-maximized",
+                    url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+        for _ in range(40):
+            if _cdp_alive():
+                self.site_message = (
+                    "Real Chrome opened. Complete One-time Code login HERE, "
+                    "keep this window open, then click Start browser bot."
+                )
+                self._emit()
+                return {"ok": True, "already": False}
+            time.sleep(0.25)
+
+        return {
+            "ok": False,
+            "error": "Chrome started but debugging port did not open. Close all Chrome windows and try again.",
+        }
+
+    def open_login_chrome(self) -> dict[str, Any]:
+        if self._running:
+            return {
+                "ok": False,
+                "error": "Stop the bot first, then open Chrome to log in.",
+            }
+        return self.ensure_real_chrome()
+
     def start(self) -> None:
         if self._running:
             return
-        # Fresh session: start balance will be read from site
+        # Do NOT kill Chrome — attach to the same real window
         self.engine.config.start_balance = 0.0
         self.config["start_balance"] = 0.0
+        self.engine.state.message = "Starting…"
+        self.live_multiplier = None
+        self.awaiting_login = False
+        self.betting_enabled = False
+        self._login_ready.clear()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run_thread, daemon=True)
         self._thread.start()
 
+    def start_betting(self) -> dict[str, Any]:
+        if not self._running:
+            return {"ok": False, "error": "Start browser bot first."}
+        self.betting_enabled = True
+        self.site_message = "Betting ON — will place bets on next rounds"
+        self._emit()
+        return {"ok": True}
+
+    def stop_betting(self) -> dict[str, Any]:
+        self.betting_enabled = False
+        self.site_message = "Betting OFF — browser still connected, watching only"
+        self._emit()
+        return {"ok": True}
+
+    def confirm_login(self) -> None:
+        self._login_ready.set()
+        self.site_message = "Login confirmed — reading balance…"
+        self._emit()
+
     def stop(self) -> None:
         self._stop.set()
+        self._login_ready.set()
         self._running = False
-        self.site_message = "Stopping…"
+        self.awaiting_login = False
+        self.betting_enabled = False
+        self.site_message = "Stopping bot (Chrome stays open)…"
         self._emit()
 
     def _run_thread(self) -> None:
@@ -77,84 +194,144 @@ class CrashBot:
         from playwright.async_api import async_playwright
 
         self._running = True
-        self.site_message = "Launching browser…"
+        self.site_message = "Connecting to real Chrome…"
         self._emit()
 
+        browser = None
         try:
+            # Ensure real Chrome is up, then attach (no Playwright-launched browser)
+            ensured = self.ensure_real_chrome()
+            if not ensured.get("ok"):
+                self.site_message = ensured.get("error", "Could not start Chrome")
+                self._emit()
+                return
+
             async with async_playwright() as p:
-                self._playwright = p
-                PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+                self.site_message = "Attaching to real Chrome (CDP)…"
+                self._emit()
+                browser = await p.chromium.connect_over_cdp(CDP_URL)
+                self._browser = browser
 
-                launch_kwargs = {
-                    "user_data_dir": str(PROFILE_DIR),
-                    "headless": bool(self.config.get("headless", False)),
-                    "args": ["--start-maximized"],
-                    "no_viewport": True,
-                }
-                # Persistent profile keeps BC.Game login across bot restarts
-                try:
-                    context = await p.chromium.launch_persistent_context(
-                        channel="chrome", **launch_kwargs
-                    )
-                except Exception:
-                    context = await p.chromium.launch_persistent_context(**launch_kwargs)
-
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
                 self._context = context
-                page = context.pages[0] if context.pages else await context.new_page()
+
+                page = None
+                url = self.config.get("site_url", "https://bc.game/game/crash")
+                for pge in context.pages:
+                    try:
+                        if "crash" in (pge.url or "").lower() or "bc" in (pge.url or "").lower():
+                            page = pge
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+                if page is None:
+                    page = context.pages[0] if context.pages else await context.new_page()
                 self._page = page
 
-                url = self.config.get("site_url", "https://bc.game/game/crash")
-                await page.goto(url, wait_until="domcontentloaded")
-                self.site_message = (
-                    "Browser open (saved session). "
-                    "Log in once if needed — waiting to read balance…"
-                )
-                self._emit()
+                try:
+                    await page.bring_to_front()
+                except Exception:  # noqa: BLE001
+                    pass
 
-                # Wait until site balance is readable (user logs in)
-                login_wait = 0
+                # Navigate only if not already on a crash-like page
+                try:
+                    cur = page.url or ""
+                except Exception:  # noqa: BLE001
+                    cur = ""
+                if "crash" not in cur.lower():
+                    await page.goto(url, wait_until="domcontentloaded")
+                    await asyncio.sleep(1.5)
+                else:
+                    await asyncio.sleep(0.8)
+
                 balance_captured = False
-                while not self._stop.is_set() and login_wait < 180:
-                    bal = await self._read_balance(page)
-                    if bal is not None and bal > 0:
-                        self.engine.set_start_balance(bal)
-                        # Persist for display after restart of process only via memory;
-                        # also update runtime config dict
-                        self.config["start_balance"] = bal
-                        balance_captured = True
-                        self.site_message = f"Start balance from site: {bal}"
-                        self._emit()
-                        break
-                    await asyncio.sleep(1)
-                    login_wait += 1
-                    if login_wait % 5 == 0:
-                        self.site_message = (
-                            f"Waiting for login / balance on site… ({login_wait}s)"
-                        )
-                        self._emit()
+                bal = await self._read_balance(page)
+                if bal is not None and bal >= 0:
+                    self.engine.set_start_balance(bal)
+                    self.config["start_balance"] = bal
+                    balance_captured = True
+                    self.site_message = f"Connected. Start balance: {bal}"
+                    self._emit()
 
-                if not balance_captured and not self._stop.is_set():
+                if not balance_captured:
+                    self.awaiting_login = True
                     self.site_message = (
-                        "Could not read balance yet — continuing; will retry in loop"
+                        "Log in in the open Chrome window (OTP works). "
+                        "When done, click “I’m logged in — continue”. Keep Chrome open."
                     )
                     self._emit()
-                elif not self._stop.is_set():
-                    self.site_message = "Bot loop started — watching rounds"
-                    self._emit()
-
-                last_phase = "unknown"
-                pending_bet: dict[str, float] | None = None
-
-                while not self._stop.is_set():
-                    if not balance_captured:
+                    while not self._stop.is_set() and not self._login_ready.is_set():
+                        await asyncio.sleep(0.4)
+                    self.awaiting_login = False
+                    if self._stop.is_set():
+                        return
+                    await asyncio.sleep(1.0)
+                    for _ in range(30):
+                        if self._stop.is_set():
+                            return
+                        if await self._login_modal_open(page):
+                            self.awaiting_login = True
+                            self._login_ready.clear()
+                            self.site_message = (
+                                "Sign-in still open — finish login, then Continue."
+                            )
+                            self._emit()
+                            while not self._stop.is_set() and not self._login_ready.is_set():
+                                await asyncio.sleep(0.4)
+                            self.awaiting_login = False
+                            await asyncio.sleep(1.0)
+                            continue
                         bal = await self._read_balance(page)
-                        if bal is not None and bal > 0:
+                        if bal is not None and bal >= 0:
                             self.engine.set_start_balance(bal)
                             self.config["start_balance"] = bal
                             balance_captured = True
                             self.site_message = f"Start balance from site: {bal}"
                             self._emit()
+                            break
+                        await asyncio.sleep(1)
+
+                if self._stop.is_set():
+                    return
+                if not balance_captured:
+                    # Last attempt with debug hint
+                    bal = await self._read_balance(page)
+                    tip = f" (saw {bal})" if bal is not None else ""
+                    self.site_message = (
+                        "Could not read wallet balance"
+                        f"{tip}. Make sure Crash page shows $ balance next to Deposit, then Start again."
+                    )
+                    self._emit()
+                    return
+
+                self.betting_enabled = False
+                self.site_message = (
+                    "Browser connected — watching site. "
+                    "Click Start bet under settings when ready."
+                )
+                self._emit()
+
+                last_phase = "unknown"
+                pending_bet: dict[str, float] | None = None
+
+                while not self._stop.is_set():
+                    if await self._login_modal_open(page):
+                        pending_bet = None
+                        self.betting_enabled = False
+                        self.awaiting_login = True
+                        self._login_ready.clear()
+                        self.site_message = (
+                            "Sign-in appeared — finish login in Chrome, then Continue."
+                        )
+                        self._emit()
+                        while not self._stop.is_set() and not self._login_ready.is_set():
+                            await asyncio.sleep(0.4)
+                        self.awaiting_login = False
+                        await asyncio.sleep(1.0)
+                        continue
+
                     if self.engine.state.mode == Mode.STOPPED:
+                        self.betting_enabled = False
                         self.site_message = self.engine.state.message
                         self._emit()
                         await asyncio.sleep(1)
@@ -167,9 +344,13 @@ class CrashBot:
 
                     phase = await self._detect_phase(page, mult)
 
-                    # Entering betting window
                     if phase == "betting" and last_phase != "betting":
-                        if self.engine.state.mode == Mode.RESTING:
+                        if not self.betting_enabled:
+                            pending_bet = None
+                            self.site_message = (
+                                "Watching rounds (betting OFF). Click Start bet to play."
+                            )
+                        elif self.engine.state.mode == Mode.RESTING:
                             self.engine.on_round_skipped()
                             self.site_message = self.engine.state.message
                             pending_bet = None
@@ -192,14 +373,11 @@ class CrashBot:
                             else:
                                 self.site_message = self.engine.state.message
 
-                    # Round crashed / ended with pending bet
                     if phase == "crashed" and last_phase not in ("crashed", "unknown"):
                         if pending_bet is not None:
                             cashout = pending_bet["cashout"]
                             crash_at = mult if mult and mult >= 1.0 else None
-                            # Win if crash multiplier reached cashout target
                             won = crash_at is not None and crash_at >= cashout
-                            # Also try DOM result hints
                             hint = await self._result_hint(page)
                             if hint is not None:
                                 won = hint
@@ -208,24 +386,27 @@ class CrashBot:
                             )
                             self.site_message = self.engine.state.message
                             pending_bet = None
-                        elif self.engine.state.mode == Mode.RESTING:
-                            # already counted on betting phase
-                            pass
 
                     last_phase = phase
                     self._emit()
                     await asyncio.sleep(0.35)
 
-                await context.close()
         except Exception as exc:  # noqa: BLE001
-            self.site_message = f"Bot error: {exc}"
+            msg = str(exc)
+            if "has been closed" in msg or "Target closed" in msg or "Target page" in msg:
+                self.site_message = "Chrome closed or disconnected"
+            else:
+                self.site_message = f"Bot error: {exc}"
             self._emit()
         finally:
+            # Disconnect only — do NOT close real Chrome
             self._running = False
             self._page = None
             self._context = None
-            if not self.site_message.startswith("Bot error"):
-                self.site_message = "Bot stopped (login session saved)"
+            self._browser = None
+            if "Bot error" not in self.site_message and "Could not" not in self.site_message:
+                if "Chrome closed" not in self.site_message:
+                    self.site_message = "Bot stopped — Chrome left open (session kept)"
             self._emit()
 
     async def _first_locator(self, page, keys: list[str]):
@@ -238,20 +419,42 @@ class CrashBot:
                 continue
         return None
 
+    async def _login_modal_open(self, page) -> bool:
+        try:
+            dialog = page.locator("[role='dialog'], [class*='modal']").filter(
+                has_text=re.compile(r"Sign In|Sign Up|One-time Code|Forgot your password", re.I)
+            )
+            n = await dialog.count()
+            for i in range(min(n, 5)):
+                node = dialog.nth(i)
+                if await node.is_visible():
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
     async def _place_bet(self, page, stake: float, cashout: float) -> bool:
+        if await self._login_modal_open(page):
+            self.site_message = "Skipped bet fill — sign-in is open"
+            return False
+
         selectors = self.config.get("selectors", {})
         amount_loc = await self._first_locator(page, selectors.get("bet_amount", []))
         cash_loc = await self._first_locator(page, selectors.get("cashout", []))
         btn_loc = await self._first_locator(page, selectors.get("bet_button", []))
 
-        if amount_loc is None or btn_loc is None:
-            # Fallback: try any visible number inputs
-            inputs = page.locator("input:visible")
-            count = await inputs.count()
-            if count >= 1 and amount_loc is None:
-                amount_loc = inputs.nth(0)
-            if count >= 2 and cash_loc is None:
-                cash_loc = inputs.nth(1)
+        # BC.Game Manual panel labels
+        if amount_loc is None:
+            amount_loc = await self._input_near_label(page, r"Amount")
+        if cash_loc is None:
+            cash_loc = await self._input_near_label(page, r"Auto cash out|Cash ?out")
+        if btn_loc is None:
+            try:
+                btn = page.get_by_role("button", name=re.compile(r"^Bet$", re.I))
+                if await btn.count() and await btn.first.is_visible():
+                    btn_loc = btn.first
+            except Exception:  # noqa: BLE001
+                pass
 
         if amount_loc is None or btn_loc is None:
             return False
@@ -270,16 +473,79 @@ class CrashBot:
             self.site_message = f"Fill error: {exc}"
             return False
 
+    async def _input_near_label(self, page, label_re: str):
+        try:
+            label = page.get_by_text(re.compile(label_re, re.I)).first
+            if await label.count() == 0:
+                return None
+            root = label.locator(
+                "xpath=ancestor::*[.//input][1]"
+            )
+            inp = root.locator("input").first
+            if await inp.count() and await inp.is_visible():
+                return inp
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
     @staticmethod
     def _fmt(value: float) -> str:
         text = f"{value:.8f}".rstrip("0").rstrip(".")
         return text if text else "0"
 
     async def _read_balance(self, page) -> float | None:
-        """Read wallet/balance amount shown on BC.Game."""
-        selectors = self.config.get("selectors", {}).get("balance", [])
-        candidates: list[float] = []
+        """Read header wallet (e.g. $0.01 next to Deposit on BC.Game)."""
+        try:
+            val = await page.evaluate(
+                """() => {
+                  const fromDollar = (t) => {
+                    if (!t) return null;
+                    const m = String(t).replace(/,/g, '').match(/\\$\\s*([\\d]+(?:\\.\\d+)?)/);
+                    return m ? parseFloat(m[1]) : null;
+                  };
 
+                  const all = Array.from(document.querySelectorAll('button, a, div, span'));
+                  const deposit = all.find((el) => {
+                    const t = (el.innerText || '').trim();
+                    return /^Deposit$/i.test(t) && el.offsetParent !== null;
+                  });
+
+                  if (deposit) {
+                    let root = deposit.parentElement;
+                    for (let depth = 0; depth < 6 && root; depth++) {
+                      const nodes = Array.from(root.querySelectorAll('div, span, p, b, strong'));
+                      for (const el of nodes) {
+                        if (el.closest('[role="dialog"]')) continue;
+                        const t = (el.innerText || '').trim();
+                        if (!t || t.length > 24) continue;
+                        if (!t.includes('$')) continue;
+                        if (/deposit/i.test(t)) continue;
+                        const v = fromDollar(t);
+                        if (v != null && v >= 0) return v;
+                      }
+                      root = root.parentElement;
+                    }
+                  }
+
+                  const header =
+                    document.querySelector('header') ||
+                    document.querySelector('[class*="Header"]') ||
+                    document.querySelector('nav');
+                  if (header) {
+                    const ms = [...(header.innerText || '').matchAll(/\\$\\s*([\\d,]+(?:\\.\\d+)?)/g)]
+                      .map((m) => parseFloat(m[1].replace(/,/g, '')))
+                      .filter((n) => !Number.isNaN(n) && n >= 0 && n < 1000000);
+                    if (ms.length) return Math.min(...ms);
+                  }
+                  return null;
+                }"""
+            )
+            if isinstance(val, (int, float)) and val >= 0:
+                return float(val)
+        except Exception as exc:  # noqa: BLE001
+            self.site_message = f"Balance scan error: {exc}"
+
+        selectors = self.config.get("selectors", {}).get("balance", [])
         for sel in selectors:
             loc = page.locator(sel)
             try:
@@ -292,43 +558,35 @@ class CrashBot:
                     if not await node.is_visible():
                         continue
                     text = (await node.inner_text()).strip()
-                    val = self._parse_money(text)
-                    if val is not None:
-                        candidates.append(val)
+                    if not text or len(text) > 30:
+                        continue
+                    if re.search(r"\d+\.\d+\s*x", text, re.I):
+                        continue
+                    parsed = self._parse_money(text)
+                    if parsed is not None and parsed >= 0:
+                        return parsed
                 except Exception:  # noqa: BLE001
                     continue
-
-        if not candidates:
-            # Fallback: header-like money amounts (avoid tiny 0.00 noise if possible)
-            try:
-                header = page.locator("header").first
-                text = await header.inner_text() if await header.count() else ""
-                for m in re.finditer(
-                    r"(?<![\d.])(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+)\s*(?:USDT|USD|BTC|ETH|SOL)?",
-                    text,
-                    flags=re.I,
-                ):
-                    val = self._parse_money(m.group(1))
-                    if val is not None and val > 0:
-                        candidates.append(val)
-            except Exception:  # noqa: BLE001
-                pass
-
-        if not candidates:
-            return None
-        # Prefer the largest plausible wallet figure in view
-        return max(candidates)
+        return None
 
     @staticmethod
     def _parse_money(text: str) -> float | None:
         if not text:
             return None
+        if re.search(r"\d+\.\d+\s*x\b", text, re.I):
+            return None
+        m = re.search(r"\$\s*([\d,]+(?:\.\d+)?)", text)
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except ValueError:
+                return None
         cleaned = text.replace(",", "").replace("\u00a0", " ").strip()
-        m = re.search(r"(\d+(?:\.\d+)?)", cleaned)
-        if not m:
+        m2 = re.search(r"(\d+(?:\.\d+)?)", cleaned)
+        if not m2:
             return None
         try:
-            return float(m.group(1))
+            return float(m2.group(1))
         except ValueError:
             return None
 
@@ -346,12 +604,10 @@ class CrashBot:
             except Exception:  # noqa: BLE001
                 continue
 
-        # Broad fallback: look for "1.23x" style text
         try:
             body = await page.locator("body").inner_text()
             matches = re.findall(r"(\d+\.\d{2})\s*x", body, flags=re.I)
             if matches:
-                # Prefer values that look like live crash multipliers
                 vals = [float(x) for x in matches if 1.0 <= float(x) <= 100000]
                 if vals:
                     return max(vals) if len(vals) < 5 else vals[0]
@@ -360,7 +616,6 @@ class CrashBot:
         return None
 
     async def _detect_phase(self, page, mult: float | None) -> str:
-        """Heuristic phases: betting | flying | crashed."""
         try:
             text = (await page.locator("body").inner_text()).lower()
         except Exception:  # noqa: BLE001
@@ -381,7 +636,6 @@ class CrashBot:
             text = (await page.locator("body").inner_text()).lower()
         except Exception:  # noqa: BLE001
             return None
-        # Very rough; prefer multiplier comparison
         if "you won" in text or "cashed out" in text:
             return True
         if "you lost" in text:

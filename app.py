@@ -115,10 +115,31 @@ def api_set_config():
     }})
 
 
+@app.post("/api/open-login")
+def api_open_login():
+    return jsonify(bot.open_login_chrome())
+
+
 @app.post("/api/start")
 def api_start():
     bot.start()
     return jsonify({"ok": True, "message": "Bot starting — browser will open"})
+
+
+@app.post("/api/betting/start")
+def api_betting_start():
+    return jsonify(bot.start_betting())
+
+
+@app.post("/api/betting/stop")
+def api_betting_stop():
+    return jsonify(bot.stop_betting())
+
+
+@app.post("/api/confirm-login")
+def api_confirm_login():
+    bot.confirm_login()
+    return jsonify({"ok": True})
 
 
 @app.post("/api/stop")

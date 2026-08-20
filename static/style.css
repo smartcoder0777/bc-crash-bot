@@ -94,6 +94,51 @@ button {
   cursor: pointer;
 }
 button.primary { background: var(--blue); border-color: transparent; }
+button.danger {
+  background: #dc2626;
+  border-color: transparent;
+  color: #fff;
+  font-size: 1.05rem;
+  font-weight: 700;
+  padding: 14px 28px;
+  min-width: 120px;
+}
+.bet-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+button.bet-on {
+  flex: 1;
+  background: #16a34a;
+  border-color: transparent;
+  color: #fff;
+  font-size: 1.05rem;
+  font-weight: 700;
+  padding: 14px 18px;
+}
+button.bet-off {
+  flex: 1;
+  background: #dc2626;
+  border-color: transparent;
+  color: #fff;
+  font-size: 1.05rem;
+  font-weight: 700;
+  padding: 14px 18px;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: none !important;
+}
+button.pulse {
+  outline: 2px solid var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.25); }
+}
 button:hover { filter: brightness(1.08); }
 
 form {

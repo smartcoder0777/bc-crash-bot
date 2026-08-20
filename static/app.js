@@ -80,6 +80,16 @@ function render(s, { syncForm = false } = {}) {
 
   el("wlTop").textContent = `${s.wins ?? 0} / ${s.losses ?? 0}`;
   el("botRunning").textContent = s.bot_running ? "RUNNING" : "off";
+  el("bettingState").textContent = s.betting_enabled ? "ON" : "off";
+  el("bettingState").className = s.betting_enabled ? "win" : "lose";
+  el("btnStartBet").disabled = !s.bot_running;
+  el("btnStopBet").disabled = !s.bot_running;
+  el("btnContinue").disabled = !s.awaiting_login;
+  if (s.awaiting_login) {
+    el("btnContinue").classList.add("pulse");
+  } else {
+    el("btnContinue").classList.remove("pulse");
+  }
   el("message").textContent = s.message || "—";
   el("siteMessage").textContent = s.site_message || "—";
   el("lossesStreak").textContent = s.consecutive_losses ?? 0;
@@ -123,11 +133,27 @@ fetch("/api/config")
   .then((r) => r.json())
   .then((cfg) => fillForm(cfg));
 
+el("btnLoginChrome").onclick = async () => {
+  const r = await fetch("/api/open-login", { method: "POST" });
+  const data = await r.json();
+  if (!data.ok) alert(data.error || "Could not open Chrome");
+};
 el("btnStart").onclick = async () => {
   await fetch("/api/start", { method: "POST" });
 };
+el("btnContinue").onclick = async () => {
+  await fetch("/api/confirm-login", { method: "POST" });
+};
 el("btnStop").onclick = async () => {
   await fetch("/api/stop", { method: "POST" });
+};
+el("btnStartBet").onclick = async () => {
+  const r = await fetch("/api/betting/start", { method: "POST" });
+  const data = await r.json();
+  if (!data.ok) alert(data.error || "Cannot start betting");
+};
+el("btnStopBet").onclick = async () => {
+  await fetch("/api/betting/stop", { method: "POST" });
 };
 el("btnReset").onclick = async () => {
   page = 1;

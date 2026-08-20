@@ -1,12 +1,12 @@
 {
-  "base_stake": 0.2,
+  "base_stake": 0.01,
   "cashout": 1.45,
   "loss_multiplier": 3.15,
   "losses_before_rest": 4,
   "rest_rounds": 10,
   "recovery_attempts": 2,
   "stop_loss": 50.0,
-  "start_balance": 0.0,
+  "start_balance": 0.01,
   "site_url": "https://bcmail2.com/game/crash",
   "headless": false,
   "selectors": {
@@ -14,20 +14,26 @@
       "[data-testid='balance']",
       ".balance-amount",
       ".wallet-balance",
-      "[class*='balance' i]",
-      "header [class*='Balance']"
+      "[class*='balance']",
+      "[class*='Balance']",
+      "[class*='wallet']",
+      "[class*='Wallet']",
+      "header >> text=/$/"
     ],
     "bet_amount": [
       "input[data-testid='bet-amount']",
       "input[placeholder*='Amount' i]",
       ".bet-input input",
-      "input[type='number']"
+      "[class*='bet'] input",
+      "[class*='Bet'] input"
     ],
     "cashout": [
       "input[data-testid='cashout']",
       "input[placeholder*='Cash' i]",
       "input[placeholder*='Payout' i]",
-      ".cashout-input input"
+      ".cashout-input input",
+      "[class*='cashout'] input",
+      "[class*='Cash'] input"
     ],
     "bet_button": [
       "button:has-text('Bet')",
@@ -39,7 +45,8 @@
       ".crash-multiplier",
       "[data-testid='multiplier']",
       ".game-multiplier",
-      "div:has-text('x')"
+      "text=/Starts in/i",
+      "text=/\\d+\\.\\d+x/"
     ]
   }
 }
