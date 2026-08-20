@@ -364,6 +364,10 @@ class CrashBot:
 
                     # Settle previous bet from DOM before opening another
                     if pending_bet is not None:
+                        if mult is not None:
+                            peak = float(pending_bet.get("peak_mult") or 0.0)
+                            if mult > peak:
+                                pending_bet["peak_mult"] = float(mult)
                         settled = await self._settle_pending(page, pending_bet, phase)
                         if settled:
                             pending_bet = None
@@ -417,6 +421,8 @@ class CrashBot:
                                             **nxt,
                                             "placed_ts": time.time(),
                                             "hist_at_place": hist,
+                                            "bal_at_place": bal,
+                                            "peak_mult": 1.0,
                                         }
                                         tag = (
                                             "RECOVERY"
@@ -458,64 +464,95 @@ class CrashBot:
     async def _settle_pending(
         self, page, pending_bet: dict[str, Any], phase: str | None = None
     ) -> bool:
-        """Settle from DOM history / crash text only (no network listeners)."""
+        """Settle win/lose from peak live mult + new history crash (never cashout field)."""
         cashout = float(pending_bet["cashout"])
         stake = float(pending_bet["stake"])
         placed_ts = float(pending_bet.get("placed_ts") or 0)
         hist_at_place = pending_bet.get("hist_at_place")
+        bal_at_place = pending_bet.get("bal_at_place")
+        peak = float(pending_bet.get("peak_mult") or 0.0)
         age = time.time() - placed_ts
 
         if phase is None:
             phase = await self._detect_phase(page, self.live_multiplier)
 
-        # Wait until round looks finished or next betting window
-        if age < 1.2 and phase == "flying":
+        # Still in the round — only track peak, do not settle yet.
+        # Early settle with old history was resetting stake to base on real losses.
+        if phase == "flying" or (self.live_multiplier is not None and self.live_multiplier > 1.01):
+            if age < 30:
+                return False
+
+        if age < 1.5:
             return False
 
-        crash_at = None
-        if phase in ("crashed", "betting", "unknown") or age >= 4.0:
-            crash_at = await self._read_latest_history_crash(page)
-            if crash_at is None:
-                crash_at = await self._read_crashed_at_text(page)
-            # Ignore unchanged history chip for a bit (still old round)
-            if (
-                crash_at is not None
-                and hist_at_place is not None
-                and abs(float(crash_at) - float(hist_at_place)) < 1e-9
-                and age < 8.0
-                and phase != "crashed"
-            ):
-                crash_at = None
+        hist = await self._read_latest_history_crash(page)
+        # Never treat the auto-cashout setting (e.g. 1.45) as the crash point
+        # unless live mult actually reached it — otherwise losses look like wins.
+        if hist is not None and abs(float(hist) - cashout) < 0.021 and peak + 1e-9 < cashout:
+            hist = None
 
-        if crash_at is not None:
+        hist_changed = (
+            hist is not None
+            and hist_at_place is not None
+            and abs(float(hist) - float(hist_at_place)) > 1e-9
+        )
+
+        won: bool | None = None
+        crash_at: float | None = None
+        source = ""
+
+        # 1) Peak live multiplier crossed cashout → auto cashout win
+        if peak + 1e-9 >= cashout and phase in ("crashed", "betting", "unknown"):
+            won = True
+            crash_at = hist if hist_changed else peak
+            source = f"peak {peak:.2f}x"
+
+        # 2) History chip actually changed after our bet
+        elif hist_changed and hist is not None:
+            crash_at = float(hist)
             won = crash_at + 1e-9 >= cashout
-            # Soft check: UI win/lose hint can override ambiguous equal-cashout
-            hint = await self._result_hint(page)
-            if hint is not None and abs(crash_at - cashout) < 0.02:
-                won = hint
-            self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
-            self.site_message = (
-                f"{'Win' if won else 'Lose'} {crash_at}x "
-                f"(cashout {cashout}x) | {self.engine.state.message}"
-            )
-            return True
+            source = f"history {crash_at}x"
 
-        hint = await self._result_hint(page)
-        if hint is not None and age >= 2.0:
-            self.engine.on_bet_result(won=hint, stake=stake, crash_at=None)
-            self.site_message = (
-                f"{'Win' if hint else 'Lose'} via UI text | {self.engine.state.message}"
-            )
-            return True
+        # 3) Wallet delta (backup)
+        if won is None and bal_at_place is not None and age >= 2.5:
+            bal = await self._read_balance(page)
+            if bal is not None:
+                delta = float(bal) - float(bal_at_place)
+                profit_min = stake * (cashout - 1.0) * 0.4
+                if delta >= profit_min:
+                    won = True
+                    crash_at = hist if hist_changed else peak or None
+                    source = f"balance +{delta:.4f}"
+                elif delta <= -stake * 0.5:
+                    won = False
+                    crash_at = hist if hist_changed else None
+                    source = f"balance {delta:.4f}"
 
-        if age >= 18.0:
-            self.engine.on_bet_result(won=False, stake=stake, crash_at=None)
-            self.site_message = (
-                f"Settle timeout — counted LOSE | {self.engine.state.message}"
-            )
-            return True
+        if won is None:
+            if age >= 20.0:
+                # Prefer lose only if we never saw cashout reached
+                if peak + 1e-9 >= cashout:
+                    won = True
+                    crash_at = peak
+                    source = "timeout-peak-win"
+                else:
+                    won = False
+                    crash_at = hist
+                    source = "timeout-lose"
+            else:
+                return False
 
-        return False
+        self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
+        nxt = self.engine.next_bet()
+        nxt_txt = (
+            f"next {nxt['stake']}"
+            if nxt and self.engine.state.mode != Mode.RESTING
+            else self.engine.state.message
+        )
+        self.site_message = (
+            f"{'Win' if won else 'Lose'} ({source}) | {nxt_txt}"
+        )
+        return True
 
     async def _first_locator(self, page, keys: list[str]):
         for sel in keys:
@@ -673,12 +710,11 @@ class CrashBot:
                 flags=re.I,
             )
             if m:
-                return float(m.group(1))
-            # Big center crash number sometimes shown alone
-            m2 = re.search(r"\b(\d+\.\d{2})\s*x\b", text)
-            if m2:
-                v = float(m2.group(1))
-                # Ignore the cashout setting if that's all we found
+                v = float(m.group(1))
+                # Ignore values that are just our cashout setting
+                cashout = float(self.engine.config.cashout)
+                if abs(v - cashout) < 0.021:
+                    return None
                 return v
         except Exception:  # noqa: BLE001
             pass
