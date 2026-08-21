@@ -183,8 +183,10 @@ class StrategyEngine:
             if st.mode == Mode.RECOVERY:
                 st.recovery_left -= 1
                 if st.recovery_left <= 0:
-                    self._stop("Recovery failed twice — bot stopped")
+                    self._stop("Recovery failed — bot stopped")
                     return
+                st.recovery_stake = round(stake * cfg.loss_multiplier, 8)
+                st.current_stake = st.recovery_stake
                 st.message = (
                     f"Recovery loss — {st.recovery_left} attempt(s) left "
                     f"at {st.recovery_stake}"
