@@ -402,21 +402,6 @@ class CrashBot:
 
                     # Settle previous bet from DOM before opening another
                     if pending_bet is not None:
-                        # Snapshot history ids only before our round starts
-                        if not pending_bet.get("saw_round"):
-                            row0 = await self._read_history_row(page)
-                            if row0:
-                                pending_bet["hist_row"] = row0
-                                pending_bet["hist_max_id"] = max(
-                                    int(x.get("id") or 0) for x in row0
-                                )
-                                self._log(
-                                    "hist baseline ids "
-                                    + str([int(x["id"]) for x in row0[-4:]])
-                                    + " v="
-                                    + str([round(x["v"], 2) for x in row0[-4:]]),
-                                    repeat_s=8,
-                                )
                         if self.live_multiplier is not None:
                             mult = float(self.live_multiplier)
                             peak = float(pending_bet.get("peak_mult") or 0.0)
@@ -429,8 +414,8 @@ class CrashBot:
                         if phase == "flying":
                             pending_bet["saw_flying"] = True
                             pending_bet["saw_round"] = True
-                        # Live multiplier often unread — leaving the betting
-                        # countdown still means the round started.
+                        # Instant 1.00–1.10 busts often skip a readable fly.
+                        # Leaving the countdown (crashed/unknown) means our round ran.
                         if phase in ("flying", "crashed", "unknown"):
                             pending_bet["saw_round"] = True
                         if phase == "betting" and pending_bet.get("saw_round"):
@@ -563,6 +548,27 @@ class CrashBot:
             self._emit()
 
     @staticmethod
+    def _hist_max_id(row: list | None) -> int:
+        return max(
+            (int(x.get("id") or 0) for x in (row or []) if isinstance(x, dict)),
+            default=0,
+        )
+
+    def _absorb_hist_baseline(
+        self, pending_bet: dict[str, Any], hist_row: list, reason: str
+    ) -> None:
+        """Treat current chips as already-seen so they cannot settle this bet."""
+        if not hist_row:
+            return
+        old = int(pending_bet.get("hist_max_id") or 0)
+        new_id = self._hist_max_id(hist_row)
+        pending_bet["hist_row"] = list(hist_row)
+        pending_bet["hist_max_id"] = new_id
+        if new_id != old:
+            vals = [round(float(x.get("v") or 0), 2) for x in hist_row[-4:]]
+            self._log(f"hist absorb ({reason}) max_id {old}->{new_id} v={vals}", repeat_s=2)
+
+    @staticmethod
     def _new_crash_from_rows(
         before: list | None, after: list | None
     ) -> float | None:
@@ -619,25 +625,50 @@ class CrashBot:
             phase = await self._detect_phase(page, live)
 
         hist_row = await self._read_history_row(page)
+        live_up = live is not None and float(live) > 1.12
+        currently_flying = phase == "flying" or live_up
+        # Same countdown we placed in — leftover chips are the previous round.
+        # After we leave betting, a new chip is this bet (including instant 1.05).
+        in_place_window = phase == "betting" and not saw_round
+
         max_id = int(pending_bet.get("hist_max_id") or 0)
-        new_crash = None
         newer = [
             x
             for x in hist_row
             if isinstance(x, dict) and int(x.get("id") or 0) > max_id
         ]
-        if newer:
-            newest = max(newer, key=lambda x: int(x.get("id") or 0))
-            new_crash = float(newest["v"])
+        newest = max(newer, key=lambda x: int(x.get("id") or 0)) if newer else None
+        new_crash = float(newest["v"]) if newest else None
+
+        # Only ignore a chip while we are clearly still flying ABOVE it.
+        # Instant 1.05: live is missing/low — that chip is ours, do not absorb.
+        stale_chip = False
+        if new_crash is not None:
+            if in_place_window:
+                stale_chip = True
+            elif live_up and float(live) > float(new_crash) + 0.05:
+                stale_chip = True
+
+        if stale_chip:
+            self._absorb_hist_baseline(
+                pending_bet,
+                hist_row,
+                f"late chip {new_crash}x phase={phase} live={live}",
+            )
+            new_crash = None
+            newest = None
+        elif newest is not None:
             self._log(
                 f"hist new id={int(newest['id'])} crash={new_crash} "
                 f"(max_id={max_id})",
                 repeat_s=2,
             )
+        elif in_place_window:
+            self._absorb_hist_baseline(pending_bet, hist_row, "pre-takeoff")
         elif hist_row_before:
             new_crash = self._new_crash_from_rows(hist_row_before, hist_row)
 
-        still_flying = phase == "flying" or (live is not None and live > 1.20)
+        still_flying = currently_flying
         if still_flying and new_crash is None and age < 40:
             self._log(f"settle wait: flying live={live} peak={peak:.2f}", repeat_s=3)
             return False
@@ -656,6 +687,7 @@ class CrashBot:
         betting_window = phase == "betting"
         back_ts = pending_bet.get("back_to_bet_ts")
         since_next_bet = (time.time() - float(back_ts)) if back_ts else 0.0
+        our_chip = new_crash is not None and not in_place_window
 
         won: bool | None = None
         crash_at: float | None = new_crash
@@ -672,18 +704,17 @@ class CrashBot:
             won = True
             source = f"wallet +{delta:.4f}"
 
-        # 2) New history chip with crash < cashout = lose NOW (even mid-crash UI),
-        #    so the multiplied bet still makes the next "Starts in" window.
-        if won is None and new_crash is not None and float(new_crash) + 1e-9 < cashout:
+        # 2) Our round's chip < cashout = lose now (instant 1.05 included)
+        if won is None and our_chip and float(new_crash) + 1e-9 < cashout:
             won = False
             crash_at = float(new_crash)
             source = f"history {crash_at}x"
             self._log(f"new crash chip {crash_at} (was {hist_row_before[:3]} now {hist_row[:3]})")
 
-        # 3) High crash chip = win only before we already know stake was lost
+        # 3) High crash chip = win only after our round started
         if (
             won is None
-            and new_crash is not None
+            and our_chip
             and float(new_crash) + 1e-9 >= cashout
             and not (delta is not None and delta <= -stake * 0.35 and since_next_bet >= 6.5)
         ):
@@ -698,8 +729,8 @@ class CrashBot:
             crash_at = peak
             source = f"peak {peak:.2f}x"
 
-        # 5) Wallet-only fallback if history chips were missed. Prefer history (step 2)
-        #    so we settle during crash and still place in the same "Starts in" window.
+        # 5) Wallet-only fallback if history chips were missed. Do not fire in
+        #    the same countdown we placed in (stake debit looks like a lose).
         if (
             won is None
             and saw_round
