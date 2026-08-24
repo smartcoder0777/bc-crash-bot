@@ -4,4 +4,4 @@ Bill-Bot
 8/21: +70 +50 -60 +60
 8/23: +30 +30 +30 -90, -100 - Don't touch the bot when it works!!!!!!!!!!!!!
 
-8/24: -60 (accident - auto crash value was set wrong) -60 + 73 +86 +77
+8/24: -60 (accident - auto crash value was set wrong) -60 + 73 +86 +77 +61

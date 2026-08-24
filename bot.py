@@ -66,6 +66,7 @@ class CrashBot:
         self._refresh_balance = False
         self._kick_bet = False
         self.live_multiplier: float | None = None
+        self._starts_in: float | None = None
         self.site_message = "Browser not started"
         self._last_log = ""
         self._last_log_ts = 0.0
@@ -396,6 +397,7 @@ class CrashBot:
                     if phase != last_logged_phase:
                         self._log(
                             f"phase {last_phase} -> {phase}  live={self.live_multiplier}  "
+                            f"starts_in={self._starts_in}  "
                             f"bet_on={self.betting_enabled}  pending={pending_bet is not None}"
                         )
                         last_logged_phase = phase
@@ -418,6 +420,22 @@ class CrashBot:
                         # Leaving the countdown (crashed/unknown) means our round ran.
                         if phase in ("flying", "crashed", "unknown"):
                             pending_bet["saw_round"] = True
+                        prev_cd = pending_bet.get("starts_in")
+                        cd = self._starts_in
+                        if cd is not None:
+                            if prev_cd is not None and float(cd) > float(prev_cd) + 1.2:
+                                # Timer jumped up = next "Starts in" after our bust.
+                                pending_bet["saw_round"] = True
+                                pending_bet.setdefault("back_to_bet_ts", time.time())
+                                self._log(
+                                    f"countdown reset {prev_cd}->{cd} — round elapsed",
+                                    repeat_s=2,
+                                )
+                            pending_bet["starts_in"] = float(cd)
+                        elif prev_cd is not None:
+                            pending_bet["saw_round"] = True
+                            pending_bet["starts_in"] = None
+                            self._log("countdown ended — round started", repeat_s=2)
                         if phase == "betting" and pending_bet.get("saw_round"):
                             pending_bet.setdefault("back_to_bet_ts", time.time())
                         settled = await self._settle_pending(page, pending_bet, phase)
@@ -503,6 +521,7 @@ class CrashBot:
                                             "peak_ts": time.time(),
                                             "saw_flying": False,
                                             "saw_round": False,
+                                            "starts_in": self._starts_in,
                                         }
                                         tag = (
                                             "RECOVERY"
@@ -625,17 +644,24 @@ class CrashBot:
             phase = await self._detect_phase(page, live)
 
         hist_row = await self._read_history_row(page)
-        # Parser was empty at click (max_id=0). First chips we see are already
-        # on the bar — lock them as baseline, do not settle this tick as a win.
-        if int(pending_bet.get("hist_max_id") or 0) <= 0 and hist_row:
-            self._absorb_hist_baseline(pending_bet, hist_row, "first visible hist")
-            hist_row_before = pending_bet.get("hist_row") or hist_row
-
         live_up = live is not None and float(live) > 1.12
         currently_flying = phase == "flying" or live_up
-        # Same countdown we placed in — leftover chips are the previous round.
-        # After we leave betting, a new chip is this bet (including instant 1.05).
-        in_place_window = phase == "betting" and not saw_round
+        cd = pending_bet.get("starts_in")
+        countdown_live = cd is not None and float(cd) > 0.4
+        # Leftover chips only while OUR countdown is still ticking.
+        # Instant 1.04 often never shows flying/crashed — next "Starts in"
+        # already up, so do not absorb that chip as previous-round junk.
+        in_place_window = phase == "betting" and not saw_round and countdown_live
+
+        # Parser was empty at click (max_id=0). If the round already elapsed,
+        # keep the newest chip as this result instead of swallowing it.
+        if int(pending_bet.get("hist_max_id") or 0) <= 0 and hist_row:
+            if in_place_window:
+                self._absorb_hist_baseline(pending_bet, hist_row, "first visible hist")
+            elif len(hist_row) >= 2:
+                older = sorted(hist_row, key=lambda x: int(x.get("id") or 0))[:-1]
+                self._absorb_hist_baseline(pending_bet, older, "first hist keep newest")
+            hist_row_before = pending_bet.get("hist_row") or hist_row
 
         max_id = int(pending_bet.get("hist_max_id") or 0)
         newer = [
@@ -722,7 +748,7 @@ class CrashBot:
             won is None
             and our_chip
             and float(new_crash) + 1e-9 >= cashout
-            and not (delta is not None and delta <= -stake * 0.35 and since_next_bet >= 6.5)
+            and not (delta is not None and delta <= -stake * 0.35 and since_next_bet >= 2.5)
         ):
             won = True
             crash_at = float(new_crash)
@@ -735,13 +761,14 @@ class CrashBot:
             crash_at = peak
             source = f"peak {peak:.2f}x"
 
-        # 5) Wallet-only fallback if history chips were missed. Do not fire in
-        #    the same countdown we placed in (stake debit looks like a lose).
+        # 5) Wallet-only fallback if history chips were missed. Debit happens at
+        #    click, so wait until the NEXT countdown (timer reset) — not 6.5s,
+        #    which is longer than the betting window.
         if (
             won is None
             and saw_round
             and betting_window
-            and since_next_bet >= 6.5
+            and since_next_bet >= 2.5
             and delta is not None
             and delta <= -stake * 0.35
             and peak + 1e-9 < cashout
@@ -752,7 +779,18 @@ class CrashBot:
 
         if won is None:
             wallet_quiet = delta is not None and abs(float(delta)) < stake * 0.1
-            if saw_round and (
+            wallet_down = delta is not None and delta <= -stake * 0.35
+            if (
+                wallet_down
+                and saw_round
+                and peak + 1e-9 < cashout
+                and not currently_flying
+                and age >= 12
+            ):
+                won = False
+                crash_at = new_crash
+                source = f"wallet {delta:.4f} timeout lose"
+            elif saw_round and (
                 age >= 40
                 or (wallet_quiet and age >= 25 and since_next_bet >= 8)
             ):
@@ -764,12 +802,13 @@ class CrashBot:
                     f"hist={len(hist_row)} max_id={max_id})"
                 )
                 return True
-            self._log(
-                f"settle wait {age:.1f}s phase={phase} saw_round={saw_round} "
-                f"next_bet_for={since_next_bet:.1f}s delta={delta} new={new_crash} peak={peak:.2f}",
-                repeat_s=3,
-            )
-            return False
+            else:
+                self._log(
+                    f"settle wait {age:.1f}s phase={phase} saw_round={saw_round} "
+                    f"next_bet_for={since_next_bet:.1f}s delta={delta} new={new_crash} peak={peak:.2f}",
+                    repeat_s=3,
+                )
+                return False
 
         self.engine.on_bet_result(won=won, stake=stake, crash_at=crash_at)
         nxt = self.engine.next_bet()
@@ -1148,22 +1187,33 @@ class CrashBot:
 
     async def _detect_phase(self, page, mult: float | None) -> str:
         """Detect round phase from UI. Prefer countdown / live mult over rare words."""
+        starts_in: float | None = None
+        hint = ""
         try:
-            hint = await page.evaluate(
+            val = await page.evaluate(
                 """() => {
                   const t = (document.body && document.body.innerText || '').toLowerCase();
-                  if (/starts?\\s*in/.test(t) || t.includes('place your bet')
+                  let startsIn = null;
+                  const m = t.match(/starts?\\s*in\\s*(\\d+(?:\\.\\d+)?)/i);
+                  if (m) startsIn = parseFloat(m[1]);
+                  let hint = '';
+                  if (startsIn != null || t.includes('place your bet')
                       || t.includes('waiting for next') || t.includes('next round')) {
-                    return 'betting';
+                    hint = 'betting';
+                  } else if (/\\bcrashed\\b|\\bbusted\\b/.test(t)) {
+                    hint = 'crashed';
                   }
-                  if (/\\bcrashed\\b|\\bbusted\\b/.test(t) && !/starts?\\s*in/.test(t)) {
-                    return 'crashed';
-                  }
-                  return '';
+                  return { hint, startsIn };
                 }"""
             )
+            if isinstance(val, dict):
+                hint = str(val.get("hint") or "")
+                raw_cd = val.get("startsIn")
+                if isinstance(raw_cd, (int, float)):
+                    starts_in = float(raw_cd)
         except Exception:  # noqa: BLE001
             hint = ""
+        self._starts_in = starts_in
 
         if hint == "betting":
             return "betting"
