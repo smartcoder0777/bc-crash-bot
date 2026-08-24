@@ -625,6 +625,12 @@ class CrashBot:
             phase = await self._detect_phase(page, live)
 
         hist_row = await self._read_history_row(page)
+        # Parser was empty at click (max_id=0). First chips we see are already
+        # on the bar — lock them as baseline, do not settle this tick as a win.
+        if int(pending_bet.get("hist_max_id") or 0) <= 0 and hist_row:
+            self._absorb_hist_baseline(pending_bet, hist_row, "first visible hist")
+            hist_row_before = pending_bet.get("hist_row") or hist_row
+
         live_up = live is not None and float(live) > 1.12
         currently_flying = phase == "flying" or live_up
         # Same countdown we placed in — leftover chips are the previous round.
@@ -745,6 +751,19 @@ class CrashBot:
             source = f"wallet {delta:.4f} no payout"
 
         if won is None:
+            wallet_quiet = delta is not None and abs(float(delta)) < stake * 0.1
+            if saw_round and (
+                age >= 40
+                or (wallet_quiet and age >= 25 and since_next_bet >= 8)
+            ):
+                self.site_message = (
+                    f"Settle timeout {age:.0f}s — dropped pending, no win/lose applied"
+                )
+                self._log(
+                    f"{self.site_message} (delta={delta} new={new_crash} "
+                    f"hist={len(hist_row)} max_id={max_id})"
+                )
+                return True
             self._log(
                 f"settle wait {age:.1f}s phase={phase} saw_round={saw_round} "
                 f"next_bet_for={since_next_bet:.1f}s delta={delta} new={new_crash} peak={peak:.2f}",
@@ -787,6 +806,15 @@ class CrashBot:
         return False
 
     async def _place_bet(self, page, stake: float, cashout: float) -> bool:
+        try:
+            return await asyncio.wait_for(
+                self._place_bet_inner(page, stake, cashout), timeout=8.0
+            )
+        except asyncio.TimeoutError:
+            self._log("place_bet fail: timed out finding/filling controls")
+            return False
+
+    async def _place_bet_inner(self, page, stake: float, cashout: float) -> bool:
         if await self._login_modal_open(page):
             self.site_message = "Skipped bet fill — sign-in is open"
             return False
@@ -800,7 +828,14 @@ class CrashBot:
         except Exception:  # noqa: BLE001
             pass
 
-        amount_loc = await self._input_near_label(page, r"^Amount")
+        amount_loc = await self._input_near_label(page, r"^(Amount|Bet Amount|Stake)")
+        if amount_loc is None:
+            try:
+                ph = page.get_by_placeholder(re.compile(r"amount|stake", re.I)).first
+                if await ph.count() and await ph.is_visible():
+                    amount_loc = ph
+            except Exception:  # noqa: BLE001
+                pass
         if amount_loc is None:
             amount_loc = await self._first_locator(
                 page, self.config.get("selectors", {}).get("bet_amount", [])
@@ -822,9 +857,9 @@ class CrashBot:
         except Exception:  # noqa: BLE001
             pass
         if btn_loc is None:
-            btn_loc = await self._first_locator(
-                page, ["button:has-text('Main Bet')", "button:has-text('Bet')"]
-            )
+            btn_sels = list(self.config.get("selectors", {}).get("bet_button", []) or [])
+            btn_sels.extend(["button:has-text('Main Bet')", "button:has-text('Bet')"])
+            btn_loc = await self._first_locator(page, btn_sels)
 
         if amount_loc is None or btn_loc is None:
             self._log(f"place_bet fail: amount={amount_loc is not None} btn={btn_loc is not None}")
@@ -885,22 +920,22 @@ class CrashBot:
             val = await page.evaluate(
                 """() => {
                   const xRe = /^(\\d+\\.\\d+)\\s*[x×]$/i;
-                  const idRe = /^(\\d{6,8})$/;
+                  const idRe = /^(\\d{5,10})$/;
                   const found = new Map();
                   const els = document.querySelectorAll('div, span, a, p, b');
                   for (const el of els) {
                     if (el.offsetParent === null) continue;
                     if (el.closest('input,label,form,textarea,[role="dialog"]')) continue;
                     const raw = (el.innerText || '').trim();
-                    if (!raw || raw.length > 32) continue;
+                    if (!raw || raw.length > 48) continue;
                     const t = raw.replace(/\\s+/g, ' ');
                     const r = el.getBoundingClientRect();
-                    if (r.top < 0 || r.top > 380) continue;
+                    if (r.top < 0 || r.top > 520) continue;
                     if (r.width < 6 || r.height < 8) continue;
-                    if (r.width > 160) continue;
+                    if (r.width > 200) continue;
 
                     let id = null, v = null;
-                    let m = t.match(/^(\\d{6,8})\\s+(\\d+\\.\\d+)\\s*[x×]$/i);
+                    let m = t.match(/^(\\d{5,10})\\s+(\\d+\\.\\d+)\\s*[x×]$/i);
                     if (m) {
                       id = Number(m[1]);
                       v = parseFloat(m[2]);
@@ -908,7 +943,7 @@ class CrashBot:
                       v = parseFloat(t);
                       const p = el.parentElement;
                       if (p) {
-                        const pm = (p.innerText || '').replace(/\\s+/g, ' ').match(/(\\d{6,8})/);
+                        const pm = (p.innerText || '').replace(/\\s+/g, ' ').match(/(\\d{5,10})/);
                         if (pm) id = Number(pm[1]);
                       }
                       let sib = el.previousElementSibling;

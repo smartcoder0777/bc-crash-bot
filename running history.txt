@@ -1,0 +1,5 @@
+8/24
+start time: 4.25 AM with balance 60
+End time:4:30 AM with balance 1.5 :  wrong settings - the default crash out value was not reset by bot settings.
+
+Start time: 4.33 AM with balance 60
