@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "BC Crash Bot",
+  "version": "1.1.16",
+  "description": "Crash strategy bot that runs inside the game tab.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "*://*.bc.game/*",
+    "*://bc.game/*",
+    "*://*.bcmail2.com/*",
+    "*://bcmail2.com/*"
+  ],
+  "action": {
+    "default_title": "BC Crash Bot",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.bc.game/*",
+        "*://bc.game/*",
+        "*://*.bcmail2.com/*",
+        "*://bcmail2.com/*"
+      ],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.bc.game/*",
+        "*://bc.game/*",
+        "*://*.bcmail2.com/*",
+        "*://bcmail2.com/*"
+      ],
+      "js": ["strategy.js", "content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

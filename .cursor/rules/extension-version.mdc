@@ -1,0 +1,16 @@
+---
+description: Bump the Chrome extension version on every extension change
+globs: extension/**
+alwaysApply: true
+---
+
+# Extension version bump
+
+Whenever you change any file under `extension/`, increment `extension/manifest.json` `"version"` in the same change.
+
+Chrome parses each dotted part as an **integer**, so `1.01` becomes `1.1` and triggers a warning. Never use leading zeros.
+
+- Use three-part versions: `1.1.1` → `1.1.2` → `1.1.3` (add 1 to the last number each update).
+- The next version must be greater than the currently installed one (missing parts count as 0, so `1.1` == `1.1.0`).
+- Do this even for small fixes. Do not leave the version unchanged after an extension edit.
+- The popup and overlay read the version from the manifest; do not hardcode it elsewhere.

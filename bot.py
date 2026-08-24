@@ -22,6 +22,103 @@ CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 
 StatusCallback = Callable[[dict[str, Any]], None]
 
+# Runs inside the game tab at ~80ms. Records countdown end + history chips so
+# Python polling cannot miss 1.00–1.02 instant busts.
+_PROBE_JS = r"""
+() => {
+  if (window.__bcBotProbe && window.__bcBotProbe._ok) return true;
+  const state = {
+    _ok: true,
+    countdown: null,
+    lastCd: null,
+    roundSeq: 0,
+    maxId: 0,
+    lastCrash: null,
+    lastCrashId: null,
+    chips: [],
+    seen: {},
+  };
+  window.__bcBotProbe = state;
+
+  const ingest = (id, v) => {
+    id = Number(id); v = parseFloat(v);
+    if (!id || !(v >= 1) || v > 1e6) return;
+    if (state.seen[id]) return;
+    state.seen[id] = true;
+    if (id > state.maxId) state.maxId = id;
+    state.chips.push({
+      id, v, ts: Date.now(),
+      roundSeq: state.roundSeq,
+      countdown: state.countdown,
+    });
+    if (state.chips.length > 40) state.chips.shift();
+    state.lastCrash = v;
+    state.lastCrashId = id;
+  };
+
+  const scanCountdown = () => {
+    const t = (document.body && document.body.innerText || '').toLowerCase();
+    let cd = null;
+    const m = t.match(/start(?:s|ing)?\s+in\s*(\d+(?:\.\d+)?)/i)
+      || t.match(/begin(?:s|ning)?\s+in\s*(\d+(?:\.\d+)?)/i)
+      || t.match(/next\s+round\s+in\s*(\d+(?:\.\d+)?)/i);
+    if (m) cd = parseFloat(m[1]);
+    if (state.lastCd != null && cd == null) state.roundSeq += 1;
+    else if (state.lastCd != null && cd != null && cd > state.lastCd + 1.2) state.roundSeq += 1;
+    state.lastCd = cd;
+    state.countdown = cd;
+  };
+
+  const scanChips = () => {
+    const xRe = /^(\d+\.\d+)\s*[x×]$/i;
+    const idRe = /^(\d{5,10})$/;
+    const els = document.querySelectorAll('div, span, a, p, b');
+    for (const el of els) {
+      if (el.offsetParent === null) continue;
+      const raw = (el.innerText || '').trim();
+      if (!raw || raw.length > 48) continue;
+      const r = el.getBoundingClientRect();
+      if (r.top < 0 || r.top > 520 || r.width < 6 || r.width > 200) continue;
+      const t = raw.replace(/\s+/g, ' ');
+      let id = null, v = null;
+      let mm = t.match(/^(\d{5,10})\s+(\d+\.\d+)\s*[x×]$/i);
+      if (mm) { id = Number(mm[1]); v = parseFloat(mm[2]); }
+      else if (xRe.test(t) && el.children.length === 0) {
+        v = parseFloat(t);
+        const p = el.parentElement;
+        if (p) {
+          const pm = (p.innerText || '').replace(/\s+/g, ' ').match(/(\d{5,10})/);
+          if (pm) id = Number(pm[1]);
+        }
+        let sib = el.previousElementSibling;
+        for (let i = 0; i < 5 && sib && !id; i++) {
+          if (idRe.test((sib.innerText || '').trim())) id = Number((sib.innerText || '').trim());
+          sib = sib.previousElementSibling;
+        }
+      } else if (idRe.test(t) && el.children.length === 0) {
+        id = Number(t);
+        let sib = el.nextElementSibling;
+        for (let i = 0; i < 5 && sib && v == null; i++) {
+          const xm = (sib.innerText || '').trim().match(xRe);
+          if (xm) v = parseFloat(xm[1]);
+          sib = sib.nextElementSibling;
+        }
+      }
+      if (id && v != null) ingest(id, v);
+    }
+  };
+
+  const tick = () => { try { scanCountdown(); scanChips(); } catch (e) {} };
+  tick();
+  setInterval(tick, 80);
+  try {
+    const mo = new MutationObserver(() => { try { scanCountdown(); } catch (e) {} });
+    mo.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+  } catch (e) {}
+  return true;
+}
+"""
+
 
 def _chrome_path() -> str | None:
     candidates = [
@@ -335,6 +432,7 @@ class CrashBot:
                     return
 
                 self.betting_enabled = False
+                await self._ensure_probe(page)
                 self.site_message = (
                     "Browser connected — watching site. "
                     "Click Start bet under settings when ready."
@@ -347,6 +445,7 @@ class CrashBot:
                 self._log("Watching Crash page — click Start bet when ready")
 
                 while not self._stop.is_set():
+                    await self._ensure_probe(page)
                     if self._refresh_balance:
                         self._refresh_balance = False
                         bal = await self._read_balance(page)
@@ -504,24 +603,30 @@ class CrashBot:
                                     self._log(self.site_message)
                                 else:
                                     hist_row = await self._read_history_row(page)
+                                    probe = await self._read_probe(page)
                                     ok = await self._place_bet(
                                         page, stake, nxt["cashout"]
                                     )
                                     if ok:
+                                        probe_max = int((probe or {}).get("maxId") or 0)
+                                        hist_max = max(
+                                            (int(x.get("id") or 0) for x in (hist_row or [])),
+                                            default=0,
+                                        )
                                         pending_bet = {
                                             **nxt,
                                             "placed_ts": time.time(),
                                             "hist_row": list(hist_row or []),
-                                            "hist_max_id": max(
-                                                (int(x.get("id") or 0) for x in (hist_row or [])),
-                                                default=0,
-                                            ),
+                                            "hist_max_id": max(hist_max, probe_max),
                                             "bal_at_place": bal,
                                             "peak_mult": 1.0,
                                             "peak_ts": time.time(),
                                             "saw_flying": False,
                                             "saw_round": False,
                                             "starts_in": self._starts_in,
+                                            "probe_seq": int((probe or {}).get("roundSeq") or 0),
+                                            "probe_cd": (probe or {}).get("countdown"),
+                                            "probe_max_id": probe_max,
                                         }
                                         tag = (
                                             "RECOVERY"
@@ -537,14 +642,16 @@ class CrashBot:
                                         )
                                     else:
                                         self.site_message = (
-                                            "Could not fill/click bet — will retry next round"
+                                            "Could not fill/click bet — will retry this/next window"
                                         )
                                         self._log(self.site_message)
+                                        last_phase = "place_fail"
                             else:
                                 self.site_message = self.engine.state.message
                                 self._log(f"next_bet empty: {self.site_message}")
 
-                    last_phase = phase
+                    if last_phase != "place_fail":
+                        last_phase = phase
                     self._emit()
                     await asyncio.sleep(0.3)
 
@@ -572,6 +679,84 @@ class CrashBot:
             (int(x.get("id") or 0) for x in (row or []) if isinstance(x, dict)),
             default=0,
         )
+
+    async def _ensure_probe(self, page) -> None:
+        try:
+            ok = await page.evaluate(
+                "() => !!(window.__bcBotProbe && window.__bcBotProbe._ok)"
+            )
+            if ok:
+                return
+            await page.evaluate(_PROBE_JS)
+            self._log("in-page crash probe installed (80ms)")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _read_probe(self, page) -> dict[str, Any] | None:
+        try:
+            val = await page.evaluate(
+                """() => {
+                  const s = window.__bcBotProbe;
+                  if (!s || !s._ok) return null;
+                  return {
+                    roundSeq: s.roundSeq,
+                    countdown: s.countdown,
+                    maxId: s.maxId,
+                    lastCrash: s.lastCrash,
+                    lastCrashId: s.lastCrashId,
+                    chips: (s.chips || []).slice(-16),
+                  };
+                }"""
+            )
+            return val if isinstance(val, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _our_crash_from_probe(
+        self, pending_bet: dict[str, Any], probe: dict[str, Any] | None
+    ) -> float | None:
+        """Crash of OUR round from in-page observer (catches 1.00–1.02)."""
+        if not probe:
+            return None
+        max_id = max(
+            int(pending_bet.get("hist_max_id") or 0),
+            int(pending_bet.get("probe_max_id") or 0),
+        )
+        place_seq = int(pending_bet.get("probe_seq") or 0)
+        place_cd = pending_bet.get("probe_cd")
+        placed_ms = float(pending_bet.get("placed_ts") or 0) * 1000.0
+        ours: list[dict[str, Any]] = []
+        leftover_max = 0
+        for c in probe.get("chips") or []:
+            if not isinstance(c, dict):
+                continue
+            cid = int(c.get("id") or 0)
+            if cid <= max_id:
+                continue
+            ts = float(c.get("ts") or 0)
+            if ts and placed_ms and ts < placed_ms - 400:
+                continue
+            seq = int(c.get("roundSeq") or 0)
+            ccd = c.get("countdown")
+            leftover = (
+                seq <= place_seq
+                and ccd is not None
+                and place_cd is not None
+                and float(ccd) <= float(place_cd) + 0.25
+            )
+            if leftover:
+                leftover_max = max(leftover_max, cid)
+                continue
+            ours.append(c)
+        if leftover_max > int(pending_bet.get("hist_max_id") or 0):
+            pending_bet["hist_max_id"] = leftover_max
+        if int(probe.get("roundSeq") or 0) > place_seq:
+            pending_bet["saw_round"] = True
+        if not ours:
+            return None
+        newest = max(ours, key=lambda x: int(x.get("id") or 0))
+        pending_bet["saw_round"] = True
+        return float(newest["v"])
 
     def _absorb_hist_baseline(
         self, pending_bet: dict[str, Any], hist_row: list, reason: str
@@ -643,6 +828,14 @@ class CrashBot:
         if phase is None:
             phase = await self._detect_phase(page, live)
 
+        probe = await self._read_probe(page)
+        probe_crash = self._our_crash_from_probe(pending_bet, probe)
+        if probe_crash is not None or (
+            probe and int(probe.get("roundSeq") or 0) > int(pending_bet.get("probe_seq") or 0)
+        ):
+            saw_round = True
+            pending_bet["saw_round"] = True
+
         hist_row = await self._read_history_row(page)
         live_up = live is not None and float(live) > 1.12
         currently_flying = phase == "flying" or live_up
@@ -700,14 +893,29 @@ class CrashBot:
         elif hist_row_before:
             new_crash = self._new_crash_from_rows(hist_row_before, hist_row)
 
+        if probe_crash is not None:
+            new_crash = probe_crash
+            in_place_window = False
+            saw_round = True
+            self._log(
+                f"probe crash {probe_crash}x seq={probe.get('roundSeq') if probe else '?'}",
+                repeat_s=2,
+            )
+
         still_flying = currently_flying
         if still_flying and new_crash is None and age < 40:
             self._log(f"settle wait: flying live={live} peak={peak:.2f}", repeat_s=3)
             return False
 
-        if not saw_round and new_crash is None and age < 14.0:
+        if not saw_round and new_crash is None and age < 5.0:
             self._log(f"settle wait: round not started {age:.1f}s phase={phase}", repeat_s=3)
             return False
+        if not saw_round and new_crash is None and age >= 5.0:
+            # Site often keeps "Place your bet" in the DOM, so phase stays
+            # betting through the whole crash. Treat 5s as round already ran.
+            saw_round = True
+            pending_bet["saw_round"] = True
+            pending_bet.setdefault("back_to_bet_ts", time.time())
 
         if new_crash is not None and abs(float(new_crash) - cashout) < 0.021:
             if not hist_row or len(hist_row) <= 1:
@@ -845,100 +1053,85 @@ class CrashBot:
         return False
 
     async def _place_bet(self, page, stake: float, cashout: float) -> bool:
+        old_timeout = 30000
         try:
+            page.set_default_timeout(1200)
             return await asyncio.wait_for(
-                self._place_bet_inner(page, stake, cashout), timeout=8.0
+                self._place_bet_inner(page, stake, cashout), timeout=4.0
             )
         except asyncio.TimeoutError:
             self._log("place_bet fail: timed out finding/filling controls")
             return False
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"place_bet fail: {exc}")
+            return False
+        finally:
+            try:
+                page.set_default_timeout(old_timeout)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _place_bet_inner(self, page, stake: float, cashout: float) -> bool:
         if await self._login_modal_open(page):
             self.site_message = "Skipped bet fill — sign-in is open"
             return False
 
-        # Ensure Manual tab if present
         try:
             manual = page.get_by_role("tab", name=re.compile(r"^Manual$", re.I))
             if await manual.count() and await manual.first.is_visible():
-                await manual.first.click()
-                await asyncio.sleep(0.15)
+                await manual.first.click(timeout=800)
+                await asyncio.sleep(0.1)
         except Exception:  # noqa: BLE001
             pass
 
-        amount_loc = await self._input_near_label(page, r"^(Amount|Bet Amount|Stake)")
-        if amount_loc is None:
-            try:
-                ph = page.get_by_placeholder(re.compile(r"amount|stake", re.I)).first
-                if await ph.count() and await ph.is_visible():
-                    amount_loc = ph
-            except Exception:  # noqa: BLE001
-                pass
-        if amount_loc is None:
-            amount_loc = await self._first_locator(
-                page, self.config.get("selectors", {}).get("bet_amount", [])
-            )
-        cash_loc = await self._input_near_label(page, r"Auto cash out")
-        if cash_loc is None:
-            cash_loc = await self._first_locator(
-                page, self.config.get("selectors", {}).get("cashout", [])
-            )
-
-        # Only the main bet button — never 2x / 10 / quick chips
-        btn_loc = None
-        try:
-            for pattern in (r"^Bet$", r"^Main Bet", r"Bet \(Next Round\)"):
-                btn = page.get_by_role("button", name=re.compile(pattern, re.I))
-                if await btn.count() and await btn.first.is_visible():
-                    btn_loc = btn.first
-                    break
-        except Exception:  # noqa: BLE001
-            pass
-        if btn_loc is None:
-            btn_sels = list(self.config.get("selectors", {}).get("bet_button", []) or [])
-            btn_sels.extend(["button:has-text('Main Bet')", "button:has-text('Bet')"])
-            btn_loc = await self._first_locator(page, btn_sels)
-
-        if amount_loc is None or btn_loc is None:
-            self._log(f"place_bet fail: amount={amount_loc is not None} btn={btn_loc is not None}")
-            return False
-
-        try:
-            stake_txt = self._fmt(stake)
-            cash_txt = self._fmt(cashout)
-
-            await amount_loc.click()
-            await amount_loc.fill("")
-            await amount_loc.press("Control+A")
-            await amount_loc.fill(stake_txt)
-            await asyncio.sleep(0.1)
-
-            # Verify amount — abort if site clamped to all-in / wrong value
-            try:
-                shown = await amount_loc.input_value()
-                shown_val = float(re.sub(r"[^\d.]", "", shown) or "nan")
-                if shown_val == shown_val:  # not NaN
-                    if abs(shown_val - stake) > max(0.0001, stake * 0.05):
-                        self.site_message = (
-                            f"Amount mismatch: wanted {stake}, field shows {shown_val} — aborted"
-                        )
-                        self._log(self.site_message)
-                        return False
-            except Exception:  # noqa: BLE001
-                pass
-
-            if cash_loc is not None:
-                await cash_loc.click()
-                await cash_loc.fill("")
-                await cash_loc.press("Control+A")
-                await cash_loc.fill(cash_txt)
-
-            await btn_loc.click()
+        filled = await page.evaluate(
+            """({stake, cashout}) => {
+              const stakeTxt = String(stake);
+              const cashTxt = String(cashout);
+              const inHeader = (el) => !!(el.closest('header, [class*="header" i], nav'));
+              const visible = (el) => {
+                const r = el.getBoundingClientRect();
+                return r.width > 30 && r.height > 14 && r.bottom > 0 && r.top < window.innerHeight;
+              };
+              const setVal = (el, v) => {
+                const proto = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, 'value'
+                );
+                if (proto && proto.set) proto.set.call(el, v);
+                else el.value = v;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              };
+              const inputs = [...document.querySelectorAll('input')].filter((el) => {
+                if (el.disabled || el.readOnly) return false;
+                if (inHeader(el)) return false;
+                if (!visible(el)) return false;
+                const mode = (el.getAttribute('inputmode') || '').toLowerCase();
+                const typ = (el.type || 'text').toLowerCase();
+                return mode === 'decimal' || typ === 'text' || typ === 'number' || typ === 'tel';
+              });
+              if (!inputs.length) return { ok: false, why: 'no-enabled-input' };
+              const amount = inputs[0];
+              const cash = inputs.length > 1 ? inputs[1] : null;
+              setVal(amount, stakeTxt);
+              if (cash) setVal(cash, cashTxt);
+              const btns = [...document.querySelectorAll('button')].filter((b) => {
+                if (b.disabled) return false;
+                if (!visible(b)) return false;
+                const t = (b.innerText || '').trim();
+                return /^(bet|main bet|bet \\(next round\\))$/i.test(t);
+              });
+              if (!btns.length) return { ok: false, why: 'no-bet-button' };
+              btns[0].click();
+              return { ok: true };
+            }""",
+            {"stake": round(stake, 8), "cashout": round(cashout, 8)},
+        )
+        if isinstance(filled, dict) and filled.get("ok"):
             return True
-        except Exception as exc:  # noqa: BLE001
-            self.site_message = f"Fill error: {exc}"
-            return False
+        why = filled.get("why") if isinstance(filled, dict) else "js-fail"
+        self._log(f"place_bet fail: {why}", repeat_s=2)
+        return False
 
     async def _input_near_label(self, page, label_re: str):
         try:
@@ -1194,11 +1387,15 @@ class CrashBot:
                 """() => {
                   const t = (document.body && document.body.innerText || '').toLowerCase();
                   let startsIn = null;
-                  const m = t.match(/starts?\\s*in\\s*(\\d+(?:\\.\\d+)?)/i);
+                  const m = t.match(/start(?:s|ing)?\\s+in\\s*(\\d+(?:\\.\\d+)?)/i)
+                    || t.match(/begin(?:s|ning)?\\s+in\\s*(\\d+(?:\\.\\d+)?)/i)
+                    || t.match(/next\\s+round\\s+in\\s*(\\d+(?:\\.\\d+)?)/i);
                   if (m) startsIn = parseFloat(m[1]);
                   let hint = '';
-                  if (startsIn != null || t.includes('place your bet')
-                      || t.includes('waiting for next') || t.includes('next round')) {
+                  if (startsIn != null) {
+                    hint = 'betting';
+                  } else if (t.includes('place your bet')
+                      || t.includes('waiting for next')) {
                     hint = 'betting';
                   } else if (/\\bcrashed\\b|\\bbusted\\b/.test(t)) {
                     hint = 'crashed';

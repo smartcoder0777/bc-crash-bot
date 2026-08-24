@@ -1,0 +1,40 @@
+#bc-crash-bot-overlay {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 2147483646;
+  width: 280px;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  color: #e7eef6;
+  background: #171e26ee;
+  border: 1px solid #2a3542;
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: 0 8px 28px #0008;
+  pointer-events: auto;
+}
+#bc-crash-bot-overlay .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  margin: 3px 0;
+}
+#bc-crash-bot-overlay .k { color: #8b9aab; }
+#bc-crash-bot-overlay .v { font-variant-numeric: tabular-nums; }
+#bc-crash-bot-overlay .on { color: #3dd68c; }
+#bc-crash-bot-overlay .off { color: #f31260; }
+#bc-crash-bot-overlay .msg {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #b8c4d1;
+  line-height: 1.35;
+  word-break: break-word;
+}
+#bc-crash-bot-overlay .title {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #8b9aab;
+  margin-bottom: 6px;
+}
