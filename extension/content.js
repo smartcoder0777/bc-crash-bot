@@ -24,7 +24,7 @@
     lastSettleAt: 0,
   };
 
-  let extVersion = "1.1.22";
+  let extVersion = "1.1.23";
   try {
     extVersion = chrome.runtime.getManifest().version;
   } catch (_) {}
@@ -263,28 +263,6 @@
       const area = r.width * r.height;
       if (Math.abs(v - cashout) < 0.021 && area < 14000) continue;
       if (!best || area > best.area) best = { v, area };
-    }
-    return best ? best.v : null;
-  }
-
-  function readCenterBust() {
-    const cashout = Number(engine.config.cashout) || 1.45;
-    const midX = window.innerWidth / 2;
-    let best = null;
-    const els = document.querySelectorAll("div, span, b, p, h1, h2, strong");
-    for (const el of els) {
-      if (el.offsetParent === null) continue;
-      const v = parseMultText((el.innerText || "").trim());
-      if (v == null || v + 1e-9 >= cashout) continue;
-      const r = el.getBoundingClientRect();
-      if (r.top < 70 || r.top > window.innerHeight * 0.72) continue;
-      if (r.width < 36 || r.height < 20) continue;
-      const area = r.width * r.height;
-      if (area < 900) continue;
-      const dist = Math.abs(r.left + r.width / 2 - midX);
-      if (!best || area > best.area || (area === best.area && dist < best.dist)) {
-        best = { v, area, dist };
-      }
     }
     return best ? best.v : null;
   }
@@ -571,6 +549,9 @@
       return;
     }
     if (id <= pendingMinId(p)) return;
+    const cash2 = round2(p.cashout || engine.config.cashout);
+    const live = engine.state.last_multiplier_seen;
+    if (crash + 1e-9 < cash2 && live != null && live > 1.12 && live > crash + 0.05) return;
     const oldest = oldestNewChip(p);
     if (oldest) {
       p.gameId = oldest.id;
@@ -650,19 +631,6 @@
     bot.placing = false;
     log(`Bet ${actual} @ ${nxt.cashout}x placed (${placed.label || "main bet"} amt=${placed.amount ?? actual})`);
     pushBetLog({ kind: "bet", stake: actual, cashout: nxt.cashout });
-    const instant = oldestNewChip(bot.pending);
-    if (instant) {
-      bot.pending.gameId = instant.id;
-      bot.pending.gameCrash = instant.v;
-      settle();
-    } else {
-      const bust = readCenterBust();
-      if (bust != null) {
-        bot.pending.gameId = pendingMinId(bot.pending) + 1;
-        bot.pending.gameCrash = bust;
-        settle();
-      }
-    }
   }
 
   function pendingMinId(p) {
@@ -702,36 +670,27 @@
     let crash = null;
     let crashId = null;
     if (next) {
-      crash = next.v;
-      crashId = next.id;
-      if (
-        p.gameId === next.id &&
-        p.gameCrash != null &&
-        Math.abs(round2(next.v) - cash2) <= 0.03 &&
-        Math.abs(round2(p.gameCrash) - cash2) > 0.03
-      ) {
-        crash = p.gameCrash;
+      const live = engine.state.last_multiplier_seen;
+      const leftoverBust =
+        next.v + 1e-9 < cash2 &&
+        live != null &&
+        live > 1.12 &&
+        live > next.v + 0.05;
+      if (!leftoverBust) {
+        crash = next.v;
+        crashId = next.id;
+        if (
+          p.gameId === next.id &&
+          p.gameCrash != null &&
+          Math.abs(round2(next.v) - cash2) <= 0.03 &&
+          Math.abs(round2(p.gameCrash) - cash2) > 0.03
+        ) {
+          crash = p.gameCrash;
+        }
       }
     } else if (p.gameId === expected && p.gameCrash != null) {
       crash = p.gameCrash;
       crashId = p.gameId;
-    }
-
-    if (crash == null) {
-      const bust = readCenterBust();
-      if (
-        bust != null &&
-        bust + 1e-9 < cash2 &&
-        age >= 0.04 &&
-        Date.now() - (bot.lastSettleAt || 0) > 280
-      ) {
-        crash = bust;
-        crashId = p.gameId || pendingMinId(p) + 1;
-      }
-    }
-    if (crash == null && p.wsCrash != null && p.wsCrash + 1e-9 < cash2 && age > 0.05) {
-      crash = p.wsCrash;
-      crashId = p.gameId || pendingMinId(p) + 1;
     }
 
     if (crash == null) {
