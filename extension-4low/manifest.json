@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "BC Crash 4-Low",
+  "version": "1.0.0",
+  "description": "Wait for 4 consecutive crash values under 1.45, then bet once at 1.9x.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "*://*.bc.game/*",
+    "*://bc.game/*",
+    "*://*.bcmail2.com/*",
+    "*://bcmail2.com/*"
+  ],
+  "action": {
+    "default_title": "BC Crash 4-Low",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.bc.game/*",
+        "*://bc.game/*",
+        "*://*.bcmail2.com/*",
+        "*://bcmail2.com/*"
+      ],
+      "js": ["strategy.js", "content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
