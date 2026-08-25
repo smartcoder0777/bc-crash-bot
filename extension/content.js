@@ -24,7 +24,7 @@
     lastSettleAt: 0,
   };
 
-  let extVersion = "1.1.23";
+  let extVersion = "1.1.24";
   try {
     extVersion = chrome.runtime.getManifest().version;
   } catch (_) {}
@@ -267,7 +267,48 @@
     return best ? best.v : null;
   }
 
-  function readChips() {
+  function bannerRoots() {
+    const out = [];
+    const seen = new Set();
+    const add = (el) => {
+      if (!el || seen.has(el)) return;
+      seen.add(el);
+      out.push(el);
+    };
+    add(document.getElementById("crash-banner"));
+    document.querySelectorAll("[id*='crash-banner' i], [class*='crash-banner' i]").forEach(add);
+    return out;
+  }
+
+  function collectBannerGames() {
+    const found = new Map();
+    const add = (id, v) => {
+      const gid = Number(id);
+      const crash = parseFloat(String(v).replace(/[x×]/gi, "").trim());
+      if (!gid || gid < 1e5 || !Number.isFinite(crash) || crash < 1 || crash >= 1e6) return;
+      found.set(gid, { id: gid, v: crash, area: 1, cashish: false });
+    };
+    for (const root of bannerRoots()) {
+      root.querySelectorAll("span.flex.flex-col, [class*='flex-col']").forEach((chip) => {
+        const spans = [...chip.querySelectorAll(":scope > span, span")].filter((s) => {
+          const t = (s.innerText || "").replace(/\s+/g, " ").trim();
+          return t && t.length < 24;
+        });
+        if (spans.length >= 2) {
+          const idTxt = (spans[0].innerText || "").trim();
+          const valTxt = (spans[1].innerText || "").trim();
+          if (/^\d{6,}$/.test(idTxt) && /(\d+(?:\.\d+)?)/.test(valTxt)) add(idTxt, valTxt);
+        }
+      });
+      const blob = (root.innerText || "").replace(/\s+/g, " ");
+      const re = /(\d{6,})\D+?(\d+(?:\.\d+)?)\s*[x×]?/gi;
+      let m;
+      while ((m = re.exec(blob))) add(m[1], m[2]);
+    }
+    return [...found.values()].sort((a, b) => a.id - b.id).slice(-24);
+  }
+
+  function readChipsFallback() {
     const xRe = /^(\d+(?:\.\d+)?)\s*[x×]$/i;
     const idRe = /^(\d{5,10})$/;
     const cash2 = round2(engine.config.cashout);
@@ -326,6 +367,12 @@
       }
     }
     return [...found.values()].sort((a, b) => a.id - b.id).slice(-24);
+  }
+
+  function readChips() {
+    const banner = collectBannerGames();
+    if (banner.length) return banner;
+    return readChipsFallback();
   }
 
   function maxChipId(chips) {
