@@ -27,7 +27,7 @@
     liveTimer: null,
   };
 
-  let extVersion = "1.1.26";
+  let extVersion = "1.1.27";
   try {
     extVersion = chrome.runtime.getManifest().version;
   } catch (_) {}
@@ -339,15 +339,25 @@
   function onNewBannerGame(id, value) {
     bot.lastGameItem = { id, crash: value, ts: Date.now() };
     const p = bot.pending;
-    if (!p) {
-      applyRestRound(id);
+    if (p) {
+      const expected = pendingMinId(p) + 1;
+      if (id < expected) return;
+      if (id === expected) {
+        p.gameId = id;
+        p.gameCrash = value;
+        p.sawRound = true;
+        settle();
+        return;
+      }
+      log(`Banner gap ${expected} → ${id} ${value}x — pending counted as lose`);
+      p.gameId = expected;
+      p.gameCrash = 1;
+      p.sawRound = true;
+      settle();
+      if (engine.state.mode === Mode.RESTING) applyRestRound(id);
       return;
     }
-    if (id <= pendingMinId(p)) return;
-    p.gameId = id;
-    p.gameCrash = value;
-    p.sawRound = true;
-    settle();
+    applyRestRound(id);
   }
 
   function sendGameValueUpdates() {
@@ -365,81 +375,17 @@
     }
   }
 
+  function absorbVisibleBanner() {
+    const games = collectBannerGames();
+    if (!games.length) return;
+    const newest = games[games.length - 1].id;
+    if (newest > bot.lastGameId) bot.lastGameId = newest;
+  }
+
   function startLiveUpdates() {
     if (bot.liveTimer) return;
     sendGameValueUpdates();
     bot.liveTimer = setInterval(sendGameValueUpdates, 200);
-  }
-
-  function readChipsFallback() {
-    const xRe = /^(\d+(?:\.\d+)?)\s*[x×]$/i;
-    const idRe = /^(\d{5,10})$/;
-    const cash2 = round2(engine.config.cashout);
-    const found = new Map();
-    const els = document.querySelectorAll("div, span, a, p, b, strong");
-    for (const el of els) {
-      if (el.offsetParent === null) continue;
-      if (el.closest("input,label,form,textarea,[role='dialog']")) continue;
-      const raw = (el.innerText || "").trim();
-      if (!raw || raw.length > 56) continue;
-      const r = el.getBoundingClientRect();
-      if (r.bottom < 0 || r.top > 220 || r.height > 72 || r.width < 4 || r.width > 220) continue;
-      const t = raw.replace(/\s+/g, " ");
-      let id = null;
-      let v = null;
-      let mm = t.match(/^(\d{5,10})\s+(\d+(?:\.\d+)?)\s*[x×]$/i);
-      if (mm) {
-        id = Number(mm[1]);
-        v = parseFloat(mm[2]);
-      } else if (xRe.test(t) && el.childElementCount <= 3) {
-        v = parseMultText(t);
-        let sib = el.previousElementSibling;
-        for (let i = 0; i < 6 && sib && !id; i++) {
-          if (idRe.test((sib.innerText || "").trim())) id = Number((sib.innerText || "").trim());
-          sib = sib.previousElementSibling;
-        }
-        if (!id) {
-          const p = el.parentElement;
-          const pt = p ? (p.innerText || "").replace(/\s+/g, " ").trim() : "";
-          if (p && pt.length <= 48) {
-            const pm = pt.match(/^(\d{5,10})\s+(\d+(?:\.\d+)?)\s*[x×]$/i) || pt.match(/(\d{5,10})/);
-            if (pm) id = Number(pm[1]);
-          }
-        }
-      } else if (idRe.test(t) && el.childElementCount <= 3) {
-        id = Number(t);
-        let sib = el.nextElementSibling;
-        for (let i = 0; i < 6 && sib && v == null; i++) {
-          v = parseMultText((sib.innerText || "").trim());
-          sib = sib.nextElementSibling;
-        }
-      }
-      if (id && v != null && v >= 1 && v < 1e6) {
-        const prev = found.get(id);
-        const area = r.width * r.height;
-        const cashish = Math.abs(round2(v) - cash2) <= 0.03;
-        if (!prev) {
-          found.set(id, { id, v, area, cashish });
-        } else if (prev.cashish && !cashish) {
-          found.set(id, { id, v, area, cashish });
-        } else if (!prev.cashish && cashish) {
-          /* keep real crash, ignore 1.45 cashout label */
-        } else if (area < prev.area) {
-          found.set(id, { id, v, area, cashish });
-        }
-      }
-    }
-    return [...found.values()].sort((a, b) => a.id - b.id).slice(-24);
-  }
-
-  function readChips() {
-    const banner = collectBannerGames();
-    if (banner.length) return banner;
-    return readChipsFallback();
-  }
-
-  function maxChipId(chips) {
-    return chips.reduce((m, c) => Math.max(m, c.id || 0), 0);
   }
 
   function parseMoney(text) {
@@ -611,71 +557,10 @@
     return { ok: true, label: normText(btn), amount: confirmed.amount, snapped: !!confirmed.snapped };
   }
 
-  function parseWsCrash(text) {
-    if (!text) return null;
-    const nums = [];
-    try {
-      const jsonish = text.replace(/^[\d]+/, "");
-      const found = jsonish.match(/"(?:crash|bust|multiplier|point|crashPoint)"\s*:\s*([\d.]+)/gi);
-      if (found) {
-        for (const f of found) {
-          const v = parseFloat(f.split(":").pop());
-          if (v >= 1 && v < 1e6) nums.push(v);
-        }
-      }
-    } catch (_) {}
-    const m = text.match(/(\d+(?:\.\d+)?)\s*[x×]/i);
-    if (m) nums.push(parseFloat(m[1]));
-    return nums.length ? nums[nums.length - 1] : null;
-  }
-
-  window.addEventListener("message", (ev) => {
-    const d = ev.data;
-    if (!d || d.source !== "bc-crash-bot") return;
-    if (d.type === "game_item") {
-      onGameItem(Number(d.id), parseFloat(d.crash));
-      return;
-    }
-    if (d.type === "ws") {
-      const crash = parseWsCrash(d.data);
-      if (crash != null && bot.pending) {
-        bot.pending.wsCrash = crash;
-        bot.pending.wsTs = Date.now();
-      }
-    }
-  });
-
-  function onGameItem(id, crash) {
-    if (!id || !Number.isFinite(crash) || crash < 1) return;
-    const prev = bot.lastGameItem;
-    if (prev && prev.id === id) {
-      bot.lastGameItem = { id, crash, ts: Date.now() };
-      return;
-    }
-    bot.lastGameItem = { id, crash, ts: Date.now() };
-    const p = bot.pending;
-    if (!p) {
-      applyRestRound(id);
-      return;
-    }
-    if (id <= pendingMinId(p)) return;
-    const oldest = oldestNewChip(p);
-    if (oldest) {
-      p.gameId = oldest.id;
-      p.gameCrash = oldest.v;
-    } else if (id === pendingMinId(p) + 1) {
-      p.gameId = id;
-      p.gameCrash = crash;
-    } else {
-      return;
-    }
-    p.sawRound = true;
-    settle();
-  }
-
   function canPlace() {
     if (!bot.betting || bot.pending || bot.dead || bot.placing) return false;
     if (engine.state.mode === Mode.RESTING || engine.state.mode === Mode.STOPPED) return false;
+    if (!bot.lastGameId) return false;
     if (Date.now() < (bot.placeAfter || 0)) return false;
     if (Date.now() - bot.lastPlaceFail <= 120) return false;
     return betButtonReady();
@@ -700,25 +585,25 @@
       log(engine.state.message);
       return;
     }
-    const chips = snapshotHistory();
-    const maxChip = maxChipId(chips);
-    const lockId = Math.max(bot.settledGameId || 0, maxChip);
+    absorbVisibleBanner();
+    if (!bot.lastGameId) return;
+    const lockId = bot.lastGameId;
     bot.placing = true;
     bot.pending = {
       stake: nxt.stake,
       cashout: nxt.cashout,
       placedAt: Date.now(),
-      maxId: maxChip,
+      maxId: lockId,
       maxGameId: lockId,
-      skipNextGameItem: false,
       roundSeq: bot.roundSeq,
       balAtPlace: bal,
       sawRound: false,
     };
+    const pendingRef = bot.pending;
     const placed = placeBet(nxt.stake, nxt.cashout);
+    bot.placing = false;
     if (!placed.ok) {
-      bot.pending = null;
-      bot.placing = false;
+      if (bot.pending === pendingRef) bot.pending = null;
       const soft = placed.why === "no-bet-button" || placed.why === "no-enabled-input";
       if (!soft) bot.lastPlaceFail = Date.now();
       if (!bot.lastPlaceFailLog || Date.now() - bot.lastPlaceFailLog > 2000) {
@@ -728,14 +613,15 @@
       return;
     }
     const actual = Number.isFinite(placed.amount) ? round8(placed.amount) : nxt.stake;
-    if (!nearStake(actual, nxt.stake)) {
-      if (engine.state.mode === Mode.RECOVERY) engine.state.recovery_stake = actual;
-      else engine.state.current_stake = actual;
-      log(`Stake snapped to ${actual} (wanted ${nxt.stake})`);
+    if (bot.pending === pendingRef) {
+      if (!nearStake(actual, nxt.stake)) {
+        if (engine.state.mode === Mode.RECOVERY) engine.state.recovery_stake = actual;
+        else engine.state.current_stake = actual;
+        log(`Stake snapped to ${actual} (wanted ${nxt.stake})`);
+      }
+      bot.pending.stake = actual;
     }
-    bot.pending.stake = actual;
     bot.didPlaceInWindow = true;
-    bot.placing = false;
     log(`Bet ${actual} @ ${nxt.cashout}x placed (${placed.label || "main bet"} amt=${placed.amount ?? actual})`);
     pushBetLog({ kind: "bet", stake: actual, cashout: nxt.cashout });
   }
@@ -744,50 +630,13 @@
     return Math.max(p.maxId || 0, p.maxGameId || 0);
   }
 
-  function snapshotHistory() {
-    const chips = readChips();
-    if (!chips.length) return chips;
-    const newest = chips.reduce((a, b) => (a.id > b.id ? a : b));
-    if (!bot.lastGameItem || newest.id > bot.lastGameItem.id) {
-      bot.lastGameItem = { id: newest.id, crash: newest.v, ts: Date.now() };
-    }
-    return chips;
-  }
-
-  function oldestNewChip(p) {
-    const minId = pendingMinId(p);
-    const newer = snapshotHistory()
-      .filter((c) => c.id > minId)
-      .sort((a, b) => a.id - b.id);
-    return newer[0] || null;
-  }
-
-  function resultChip(p) {
-    return oldestNewChip(p);
-  }
-
   function settle() {
     const p = bot.pending;
     if (!p) return;
     const age = (Date.now() - p.placedAt) / 1000;
     const cash2 = round2(p.cashout);
-    const expected = pendingMinId(p) + 1;
-    const next = resultChip(p);
 
-    let crash = null;
-    let crashId = null;
-    if (p.gameId && p.gameCrash != null && p.gameId > pendingMinId(p)) {
-      crash = p.gameCrash;
-      crashId = p.gameId;
-    } else if (next) {
-      crash = next.v;
-      crashId = next.id;
-    } else if (p.gameId === expected && p.gameCrash != null) {
-      crash = p.gameCrash;
-      crashId = p.gameId;
-    }
-
-    if (crash == null) {
+    if (p.gameId == null || p.gameCrash == null) {
       if (age >= 180) {
         log("Settle timeout — no crash result after 180s, dropped pending");
         bot.pending = null;
@@ -795,13 +644,10 @@
       return;
     }
 
+    const crash = p.gameCrash;
+    const crashId = p.gameId;
     const crash2 = round2(crash);
-    let won = null;
-    if (crash2 + 1e-9 < cash2) {
-      won = false;
-    } else {
-      won = true;
-    }
+    const won = !(crash2 + 1e-9 < cash2);
 
     const source = `${crashId || "?"} ${crash2}x ${won ? ">=" : "<"} ${cash2}x`;
     engine.onBetResult(won, p.stake, crash);
@@ -864,18 +710,6 @@
     });
   }
 
-  function tickRest() {
-    if (engine.state.mode !== Mode.RESTING || bot.pending) return;
-    const minId = bot.lastRestGameId || bot.settledGameId || 0;
-    const newer = readChips()
-      .filter((c) => c.id > minId)
-      .sort((a, b) => a.id - b.id);
-    for (const c of newer) {
-      if (engine.state.mode !== Mode.RESTING) break;
-      applyRestRound(c.id);
-    }
-  }
-
   function tick() {
     if (!extAlive()) {
       die();
@@ -894,10 +728,8 @@
         log(`phase ${bot.lastPhase} -> ${phase} live=${live ?? "—"} cd=${cd ?? "—"}`);
       }
 
-      snapshotHistory();
       if (bot.pending) settle();
       watchBanner();
-      tickRest();
       if (canPlace()) tryPlace();
 
       bot.lastPhase = phase;
