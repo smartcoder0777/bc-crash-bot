@@ -11,6 +11,7 @@
     roundSeq: 0,
     siteMessage: "Extension loaded. Open the popup and click Start bet.",
     logs: [],
+    betLog: [],
     lastPlaceFail: 0,
     didPlaceInWindow: false,
     lastGameItem: null,
@@ -18,9 +19,11 @@
     lastRestGameId: 0,
     placeAfter: 0,
     dead: false,
+    placing: false,
+    tickBusy: false,
   };
 
-  let extVersion = "1.1.16";
+  let extVersion = "1.1.21";
   try {
     extVersion = chrome.runtime.getManifest().version;
   } catch (_) {}
@@ -53,6 +56,14 @@
     bot.siteMessage = msg;
     console.log("[BC Bot]", msg);
     renderOverlay();
+  }
+
+  function pushBetLog(entry) {
+    bot.betLog.push({
+      t: new Date().toLocaleTimeString(),
+      ...entry,
+    });
+    if (bot.betLog.length > 150) bot.betLog.shift();
   }
 
   function inHeader(el) {
@@ -251,6 +262,7 @@
   function readChips() {
     const xRe = /^(\d+\.\d+)\s*[x×]$/i;
     const idRe = /^(\d{5,10})$/;
+    const cash2 = round2(engine.config.cashout);
     const found = new Map();
     const els = document.querySelectorAll("div, span, a, p, b");
     for (const el of els) {
@@ -259,7 +271,7 @@
       const raw = (el.innerText || "").trim();
       if (!raw || raw.length > 48) continue;
       const r = el.getBoundingClientRect();
-      if (r.top < 0 || r.top > 520 || r.width < 6 || r.width > 200) continue;
+      if (r.top < 0 || r.top > 160 || r.height > 64 || r.width < 6 || r.width > 180) continue;
       const t = raw.replace(/\s+/g, " ");
       let id = null;
       let v = null;
@@ -269,15 +281,18 @@
         v = parseFloat(mm[2]);
       } else if (xRe.test(t) && el.children.length === 0) {
         v = parseFloat(t);
-        const p = el.parentElement;
-        if (p) {
-          const pm = (p.innerText || "").replace(/\s+/g, " ").match(/(\d{5,10})/);
-          if (pm) id = Number(pm[1]);
-        }
         let sib = el.previousElementSibling;
         for (let i = 0; i < 5 && sib && !id; i++) {
           if (idRe.test((sib.innerText || "").trim())) id = Number((sib.innerText || "").trim());
           sib = sib.previousElementSibling;
+        }
+        if (!id) {
+          const p = el.parentElement;
+          const pt = p ? (p.innerText || "").replace(/\s+/g, " ").trim() : "";
+          if (p && pt.length <= 40) {
+            const pm = pt.match(/^(\d{5,10})\s+(\d+\.\d+)\s*[x×]$/i) || pt.match(/(\d{5,10})/);
+            if (pm) id = Number(pm[1]);
+          }
         }
       } else if (idRe.test(t) && el.children.length === 0) {
         id = Number(t);
@@ -290,7 +305,15 @@
       }
       if (id && v >= 1 && v < 1e6) {
         const prev = found.get(id);
-        if (!prev || r.width * r.height < prev.area) found.set(id, { id, v, area: r.width * r.height });
+        const area = r.width * r.height;
+        const cashish = Math.abs(round2(v) - cash2) <= 0.03;
+        if (!prev) {
+          found.set(id, { id, v, area, cashish });
+        } else if (prev.cashish && !cashish) {
+          found.set(id, { id, v, area, cashish });
+        } else if (prev.cashish === cashish && area < prev.area) {
+          found.set(id, { id, v, area, cashish });
+        }
       }
     }
     return [...found.values()].sort((a, b) => a.id - b.id).slice(-24);
@@ -513,24 +536,26 @@
     bot.lastGameItem = { id, crash, ts: Date.now() };
     const p = bot.pending;
     if (!p) {
-      if (engine.state.mode === Mode.RESTING && id !== bot.lastRestGameId) {
-        bot.lastRestGameId = id;
-        engine.onRoundSkipped();
-        log(engine.state.message);
-      }
+      applyRestRound(id);
       return;
     }
-    if (id <= (p.maxGameId || 0)) return;
-    p.skipNextGameItem = false;
-    p.gameId = id;
-    p.gameCrash = crash;
+    if (id <= pendingMinId(p)) return;
+    const oldest = oldestNewChip(p);
+    if (oldest) {
+      p.gameId = oldest.id;
+      p.gameCrash = oldest.v;
+    } else if (id === pendingMinId(p) + 1) {
+      p.gameId = id;
+      p.gameCrash = crash;
+    } else {
+      return;
+    }
     p.sawRound = true;
     settle();
-    if (canPlace()) tryPlace();
   }
 
   function canPlace() {
-    if (!bot.betting || bot.pending || bot.dead) return false;
+    if (!bot.betting || bot.pending || bot.dead || bot.placing) return false;
     if (engine.state.mode === Mode.RESTING || engine.state.mode === Mode.STOPPED) return false;
     if (Date.now() < (bot.placeAfter || 0)) return false;
     if (Date.now() - bot.lastPlaceFail <= 120) return false;
@@ -538,14 +563,12 @@
   }
 
   function tryPlace() {
-    if (!bot.betting) return;
-    if (bot.pending) return;
+    if (!canPlace()) return;
     if (engine.state.mode === Mode.STOPPED) {
       bot.betting = false;
       log(engine.state.message);
       return;
     }
-    if (engine.state.mode === Mode.RESTING) return;
     const nxt = engine.nextBet();
     if (!nxt) {
       log(engine.state.message);
@@ -558,10 +581,25 @@
       log(engine.state.message);
       return;
     }
-    const chips = readChips();
+    const chips = snapshotHistory();
     const maxChip = maxChipId(chips);
+    const lockId = Math.max(bot.settledGameId || 0, maxChip);
+    bot.placing = true;
+    bot.pending = {
+      stake: nxt.stake,
+      cashout: nxt.cashout,
+      placedAt: Date.now(),
+      maxId: maxChip,
+      maxGameId: lockId,
+      skipNextGameItem: false,
+      roundSeq: bot.roundSeq,
+      balAtPlace: bal,
+      sawRound: false,
+    };
     const placed = placeBet(nxt.stake, nxt.cashout);
     if (!placed.ok) {
+      bot.pending = null;
+      bot.placing = false;
       const soft = placed.why === "no-bet-button" || placed.why === "no-enabled-input";
       if (!soft) bot.lastPlaceFail = Date.now();
       if (!bot.lastPlaceFailLog || Date.now() - bot.lastPlaceFailLog > 2000) {
@@ -576,42 +614,43 @@
       else engine.state.current_stake = actual;
       log(`Stake snapped to ${actual} (wanted ${nxt.stake})`);
     }
-    bot.pending = {
-      stake: actual,
-      cashout: nxt.cashout,
-      placedAt: Date.now(),
-      maxId: maxChip,
-      maxGameId: Math.max(bot.settledGameId || 0, maxChip),
-      skipNextGameItem: false,
-      roundSeq: bot.roundSeq,
-      balAtPlace: bal,
-      sawRound: false,
-    };
+    bot.pending.stake = actual;
     bot.didPlaceInWindow = true;
+    bot.placing = false;
     log(`Bet ${actual} @ ${nxt.cashout}x placed (${placed.label || "main bet"} amt=${placed.amount ?? actual})`);
+    pushBetLog({ kind: "bet", stake: actual, cashout: nxt.cashout });
+    const instant = oldestNewChip(bot.pending);
+    if (instant) {
+      bot.pending.gameId = instant.id;
+      bot.pending.gameCrash = instant.v;
+      settle();
+    }
   }
 
-  function nextChipAfter(minId) {
-    const cash2 = round2(engine.config.cashout);
-    const newer = readChips().filter((c) => c.id > minId && Math.abs(round2(c.v) - cash2) > 0.03);
-    if (!newer.length) return null;
-    return newer.reduce((a, b) => (a.id < b.id ? a : b));
+  function pendingMinId(p) {
+    return Math.max(p.maxId || 0, p.maxGameId || 0);
   }
 
-  function noteNewestChip() {
+  function snapshotHistory() {
     const chips = readChips();
-    if (!chips.length) return;
+    if (!chips.length) return chips;
     const newest = chips.reduce((a, b) => (a.id > b.id ? a : b));
     if (!bot.lastGameItem || newest.id > bot.lastGameItem.id) {
       bot.lastGameItem = { id: newest.id, crash: newest.v, ts: Date.now() };
     }
-    const p = bot.pending;
-    if (!p || p.gameCrash != null) return;
-    const next = nextChipAfter(Math.max(p.maxId || 0, p.maxGameId || 0));
-    if (next) {
-      p.gameId = next.id;
-      p.gameCrash = next.v;
-    }
+    return chips;
+  }
+
+  function oldestNewChip(p) {
+    const minId = pendingMinId(p);
+    const newer = snapshotHistory()
+      .filter((c) => c.id > minId)
+      .sort((a, b) => a.id - b.id);
+    return newer[0] || null;
+  }
+
+  function resultChip(p) {
+    return oldestNewChip(p);
   }
 
   function settle() {
@@ -619,16 +658,26 @@
     if (!p) return;
     const age = (Date.now() - p.placedAt) / 1000;
     const cash2 = round2(p.cashout);
-    const minId = Math.max(p.maxId || 0, p.maxGameId || 0);
-    const next = nextChipAfter(minId);
+    const expected = pendingMinId(p) + 1;
+    const next = resultChip(p);
 
-    let crash = p.gameCrash != null ? p.gameCrash : null;
-    let crashId = p.gameId || null;
-    if (crash == null && next) {
+    let crash = null;
+    let crashId = null;
+    if (next) {
       crash = next.v;
       crashId = next.id;
+      if (
+        p.gameId === next.id &&
+        p.gameCrash != null &&
+        Math.abs(round2(next.v) - cash2) <= 0.03 &&
+        Math.abs(round2(p.gameCrash) - cash2) > 0.03
+      ) {
+        crash = p.gameCrash;
+      }
+    } else if (p.gameId === expected && p.gameCrash != null) {
+      crash = p.gameCrash;
+      crashId = p.gameId;
     }
-    if (crash == null && p.wsCrash != null && age > 0.2) crash = p.wsCrash;
 
     if (crash == null) {
       if (age >= 180) {
@@ -649,11 +698,43 @@
     const source = `${crashId || "?"} ${crash2}x ${won ? ">=" : "<"} ${cash2}x`;
     engine.onBetResult(won, p.stake, crash);
     log(`${won ? "Win" : "Lose"} (${source}) | ${engine.state.message}`);
+    const last = engine.state.history[engine.state.history.length - 1];
+    pushBetLog({
+      kind: won ? "win" : "lose",
+      stake: p.stake,
+      profit: last ? last.profit : won ? round8(p.stake * (p.cashout - 1)) : round8(-p.stake),
+      crash: crash2,
+      crashId: crashId || null,
+    });
     bot.pending = null;
     bot.didPlaceInWindow = false;
     bot.settledGameId = crashId || (bot.lastGameItem && bot.lastGameItem.id) || 0;
-    bot.placeAfter = Date.now() + 80;
+    bot.placeAfter = Date.now() + (won ? 80 : 0);
+    if (engine.state.mode === Mode.RESTING) bot.lastRestGameId = bot.settledGameId;
     if (engine.state.mode === Mode.STOPPED) bot.betting = false;
+  }
+
+  function applyRestRound(id) {
+    if (engine.state.mode !== Mode.RESTING || bot.pending) return false;
+    const gid = Number(id);
+    if (!gid || gid === bot.lastRestGameId) return false;
+    if (gid <= (bot.lastRestGameId || bot.settledGameId || 0)) return false;
+    bot.lastRestGameId = gid;
+    engine.onRoundSkipped();
+    log(engine.state.message);
+    return true;
+  }
+
+  function tickRest() {
+    if (engine.state.mode !== Mode.RESTING || bot.pending) return;
+    const minId = bot.lastRestGameId || bot.settledGameId || 0;
+    const newer = readChips()
+      .filter((c) => c.id > minId)
+      .sort((a, b) => a.id - b.id);
+    for (const c of newer) {
+      if (engine.state.mode !== Mode.RESTING) break;
+      applyRestRound(c.id);
+    }
   }
 
   function tick() {
@@ -661,6 +742,8 @@
       die();
       return;
     }
+    if (bot.tickBusy) return;
+    bot.tickBusy = true;
     try {
       syncStartFromWallet(readBalance());
       const live = readLiveMult();
@@ -672,10 +755,9 @@
         log(`phase ${bot.lastPhase} -> ${phase} live=${live ?? "—"} cd=${cd ?? "—"}`);
       }
 
-      if (bot.pending || engine.state.mode === Mode.RESTING) noteNewestChip();
-      if (phase !== "betting") bot.didPlaceInWindow = false;
-
+      snapshotHistory();
       if (bot.pending) settle();
+      tickRest();
       if (canPlace()) tryPlace();
 
       bot.lastPhase = phase;
@@ -686,6 +768,8 @@
         return;
       }
       console.error("[BC Bot] tick", err);
+    } finally {
+      bot.tickBusy = false;
     }
   }
 
@@ -695,7 +779,8 @@
     snap.pending_stake = bot.pending ? bot.pending.stake : null;
     snap.site_message = bot.siteMessage;
     snap.live_multiplier = engine.state.last_multiplier_seen;
-    snap.logs = bot.logs.slice(-20);
+    snap.logs = bot.logs.slice(-80);
+    snap.bet_log = bot.betLog.slice(-100);
     snap.config = { ...engine.config };
     return snap;
   }
@@ -761,6 +846,8 @@
       }
       if (msg.type === "RESET") {
         bot.pending = null;
+        bot.betLog = [];
+        bot.logs = [];
         engine.reset();
         const bal = readBalance();
         if (bal != null) engine.setStartBalance(bal);

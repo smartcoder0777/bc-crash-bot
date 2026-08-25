@@ -114,6 +114,58 @@ function fillForm(cfg) {
   });
 }
 
+function fmtAmt(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  return (v >= 0 ? "+" : "") + v.toFixed(4);
+}
+
+function fmtStake(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  return String(v);
+}
+
+function renderLog(s) {
+  const won = document.getElementById("logWon");
+  const lost = document.getElementById("logLost");
+  const pnl = document.getElementById("logPnl");
+  won.textContent = Number(s.total_won || 0).toFixed(4);
+  lost.textContent = Number(s.total_lost || 0).toFixed(4);
+  const pl = Number(s.session_pnl || 0);
+  pnl.textContent = fmtAmt(pl);
+  pnl.className = pl >= 0 ? "win" : "lose";
+
+  const box = document.getElementById("logList");
+  const rows = Array.isArray(s.bet_log) ? s.bet_log : [];
+  if (!rows.length) {
+    box.innerHTML = `<div class="log-empty">No bets yet. Start bet on the Bot tab.</div>`;
+    return;
+  }
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 28;
+  box.innerHTML = rows
+    .slice()
+    .reverse()
+    .map((r) => {
+      const kind = r.kind || "bet";
+      const label = kind === "win" ? "WIN" : kind === "lose" ? "LOSE" : "BET";
+      const amount =
+        kind === "bet"
+          ? `@ ${r.cashout ?? "—"}x`
+          : fmtAmt(r.profit);
+      const crash = r.crash != null ? `${r.crash}x` : "—";
+      return `<div class="log-row ${kind}">
+        <span>${r.t || ""}</span>
+        <span class="kind">${label}</span>
+        <span>${fmtStake(r.stake)}</span>
+        <span class="${kind === "win" ? "win" : kind === "lose" ? "lose" : ""}">${amount}</span>
+        <span>${crash}</span>
+      </div>`;
+    })
+    .join("");
+  if (atBottom) box.scrollTop = 0;
+}
+
 function render(s, { syncForm = false } = {}) {
   if (!s) return;
   document.getElementById("mode").textContent = s.mode || "idle";
@@ -132,6 +184,7 @@ function render(s, { syncForm = false } = {}) {
   document.getElementById("bal").textContent =
     s.current_balance != null ? Number(s.current_balance).toFixed(4) : "—";
   document.getElementById("msg").textContent = s.site_message || s.message || "—";
+  renderLog(s);
   if (syncForm && s.config) {
     fillForm(s.config);
     formReady = true;
@@ -140,6 +193,16 @@ function render(s, { syncForm = false } = {}) {
     formReady = true;
   }
 }
+
+document.querySelectorAll(".tab").forEach((btn) => {
+  btn.onclick = () => {
+    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    const id = btn.getAttribute("data-tab");
+    document.getElementById("panelBot").classList.toggle("hidden", id !== "bot");
+    document.getElementById("panelLog").classList.toggle("hidden", id !== "log");
+  };
+});
 
 document.getElementById("btnStart").onclick = async () => {
   document.getElementById("msg").textContent = "Starting…";

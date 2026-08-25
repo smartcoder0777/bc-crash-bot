@@ -9,32 +9,57 @@
   <h1>BC Crash Bot <span id="extVer" class="ver"></span></h1>
   <p id="pageHint" class="hint">Open a crash game tab, then Start bet.</p>
 
-  <div class="stats">
-    <div><span>Mode</span><b id="mode">idle</b></div>
-    <div><span>Betting</span><b id="betting">off</b></div>
-    <div><span>Stake</span><b id="stake">—</b></div>
-    <div><span>P/L</span><b id="pnl">0</b></div>
-    <div><span>W / L</span><b id="wl">0 / 0</b></div>
-    <div><span>Balance</span><b id="bal">—</b></div>
-  </div>
-  <p id="msg" class="msg">—</p>
-
-  <div class="actions">
-    <button type="button" id="btnStart" class="on">Start bet</button>
-    <button type="button" id="btnStop" class="off">Stop bet</button>
-    <button type="button" id="btnReset">Reset</button>
+  <div class="tabs" role="tablist">
+    <button type="button" class="tab active" data-tab="bot" id="tabBot">Bot</button>
+    <button type="button" class="tab" data-tab="log" id="tabLog">Log</button>
   </div>
 
-  <form id="cfg">
-    <label>Base stake B <input name="base_stake" type="number" step="any" /></label>
-    <label>Cash out <input name="cashout" type="number" step="any" /></label>
-    <label>Loss multiplier <input name="loss_multiplier" type="number" step="any" /></label>
-    <label>Losses before rest <input name="losses_before_rest" type="number" step="1" /></label>
-    <label>Rest rounds <input name="rest_rounds" type="number" step="1" /></label>
-    <label>Recovery attempts <input name="recovery_attempts" type="number" step="1" /></label>
-    <label>Stop loss <input name="stop_loss" type="number" step="any" /></label>
-    <button type="submit" class="on">Save settings</button>
-  </form>
+  <section id="panelBot" class="tab-panel">
+    <div class="stats">
+      <div><span>Mode</span><b id="mode">idle</b></div>
+      <div><span>Betting</span><b id="betting">off</b></div>
+      <div><span>Stake</span><b id="stake">—</b></div>
+      <div><span>P/L</span><b id="pnl">0</b></div>
+      <div><span>W / L</span><b id="wl">0 / 0</b></div>
+      <div><span>Balance</span><b id="bal">—</b></div>
+    </div>
+    <p id="msg" class="msg">—</p>
+
+    <div class="actions">
+      <button type="button" id="btnStart" class="on">Start bet</button>
+      <button type="button" id="btnStop" class="off">Stop bet</button>
+      <button type="button" id="btnReset">Reset</button>
+    </div>
+
+    <form id="cfg">
+      <label>Base stake B <input name="base_stake" type="number" step="any" /></label>
+      <label>Cash out <input name="cashout" type="number" step="any" /></label>
+      <label>Loss multiplier <input name="loss_multiplier" type="number" step="any" /></label>
+      <label>Losses before rest <input name="losses_before_rest" type="number" step="1" /></label>
+      <label>Rest rounds <input name="rest_rounds" type="number" step="1" /></label>
+      <label>Recovery attempts <input name="recovery_attempts" type="number" step="1" /></label>
+      <label>Stop loss <input name="stop_loss" type="number" step="any" /></label>
+      <button type="submit" class="on">Save settings</button>
+    </form>
+  </section>
+
+  <section id="panelLog" class="tab-panel hidden">
+    <div class="log-totals">
+      <div><span>Won</span><b id="logWon" class="win">0</b></div>
+      <div><span>Lost</span><b id="logLost" class="lose">0</b></div>
+      <div><span>P/L</span><b id="logPnl">0</b></div>
+    </div>
+    <div class="log-head">
+      <span>Time</span>
+      <span>Type</span>
+      <span>Bet</span>
+      <span>Amount</span>
+      <span>Crash</span>
+    </div>
+    <div id="logList" class="log-list">
+      <div class="log-empty">No bets yet. Start bet on the Bot tab.</div>
+    </div>
+  </section>
 
   <p class="hint">Load this folder as an unpacked extension. Keep the crash tab visible.</p>
   <script src="popup.js"></script>
