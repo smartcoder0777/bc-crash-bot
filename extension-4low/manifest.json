@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BC Crash 4-Low",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Wait for 4 consecutive crash values under 1.45, then bet once at 1.9x.",
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": [

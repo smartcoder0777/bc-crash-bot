@@ -107,6 +107,14 @@
       }
     }
 
+    setWatchingStreak(n, crashes) {
+      this.state.mode = Mode.WATCHING;
+      this.state.skip_remaining = 0;
+      this.state.low_streak = Math.max(0, Number(n) || 0);
+      if (Array.isArray(crashes)) this.state.recent_crashes = crashes.slice(-8);
+      this._syncMessage();
+    }
+
     updateConfig(data) {
       this.config = { ...this.config, ...data };
       this._syncMessage();

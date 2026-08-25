@@ -25,9 +25,11 @@
     bannerObs: null,
     lastGameId: 0,
     liveTimer: null,
+    awaitingBet: false,
+    armedAtId: 0,
   };
 
-  let extVersion = "1.0.0";
+  let extVersion = "1.0.1";
   try {
     extVersion = chrome.runtime.getManifest().version;
   } catch (_) {}
@@ -346,6 +348,7 @@
         p.gameId = id;
         p.gameCrash = value;
         p.sawRound = true;
+        bot.awaitingBet = false;
         settle();
         return;
       }
@@ -353,11 +356,13 @@
       p.gameId = expected;
       p.gameCrash = 1;
       p.sawRound = true;
+      bot.awaitingBet = false;
       settle();
-      if (engine.state.mode === Mode.SKIPPING) observeRound(value);
+      if (engine.state.mode === Mode.SKIPPING) observeRound(value, id);
       return;
     }
-    observeRound(value);
+    observeRound(value, id);
+    if (bot.awaitingBet) tryPlace();
   }
 
   function sendGameValueUpdates() {
@@ -373,13 +378,37 @@
       bot.lastGameId = g.id;
       onNewBannerGame(g.id, g.v);
     }
+    if (bot.awaitingBet && !bot.pending) tryPlace();
   }
 
-  function absorbVisibleBanner() {
+  function bannerTailLows() {
     const games = collectBannerGames();
-    if (!games.length) return;
-    const newest = games[games.length - 1].id;
-    if (newest > bot.lastGameId) bot.lastGameId = newest;
+    const low = Number(engine.config.low_below) || 1.45;
+    const tail = [];
+    for (let i = games.length - 1; i >= 0; i--) {
+      const v = round2(games[i].v);
+      if (v + 1e-9 < low) tail.unshift(v);
+      else break;
+    }
+    return { games, tail };
+  }
+
+  function applyBannerTailStreak() {
+    const { games, tail } = bannerTailLows();
+    if (games.length) {
+      const newest = games[games.length - 1].id;
+      if (!bot.lastGameId || newest > bot.lastGameId) bot.lastGameId = newest;
+    }
+    engine.setWatchingStreak(tail.length, tail);
+    bot.awaitingBet = false;
+    bot.armedAtId = 0;
+    if (bot.betting && engine.shouldBet() && games.length) {
+      bot.awaitingBet = true;
+      bot.armedAtId = games[games.length - 1].id;
+    }
+    const shown = tail.length ? tail.map((v) => v.toFixed(2)).join("  ") : "—";
+    const need = Number(engine.config.streak_needed) || 4;
+    log(`Banner lows ${tail.length}/${need} [${shown}]${bot.awaitingBet ? " — bet next round" : ""}`);
   }
 
   function startLiveUpdates() {
@@ -560,7 +589,7 @@
   function canPlace() {
     if (!bot.betting || bot.pending || bot.dead || bot.placing) return false;
     if (engine.state.mode === Mode.SKIPPING || engine.state.mode === Mode.STOPPED) return false;
-    if (!engine.shouldBet()) return false;
+    if (!bot.awaitingBet || !engine.shouldBet()) return false;
     if (!bot.lastGameId) return false;
     if (Date.now() < (bot.placeAfter || 0)) return false;
     if (Date.now() - bot.lastPlaceFail <= 120) return false;
@@ -583,12 +612,12 @@
     if (bal != null && nxt.stake > bal + 1e-9) {
       engine._stop(`Can't afford next stake ${nxt.stake} (balance ${bal}) — bot stopped`);
       bot.betting = false;
+      bot.awaitingBet = false;
       log(engine.state.message);
       return;
     }
-    absorbVisibleBanner();
-    if (!bot.lastGameId) return;
-    const lockId = bot.lastGameId;
+    const lockId = bot.armedAtId || bot.lastGameId;
+    if (!lockId) return;
     bot.placing = true;
     bot.pending = {
       stake: nxt.stake,
@@ -621,6 +650,7 @@
       bot.pending.stake = actual;
     }
     bot.didPlaceInWindow = true;
+    bot.awaitingBet = false;
     log(`Bet ${actual} @ ${nxt.cashout}x placed (${placed.label || "main bet"} amt=${placed.amount ?? actual})`);
     pushBetLog({ kind: "bet", stake: actual, cashout: nxt.cashout });
   }
@@ -660,6 +690,8 @@
       crashId: crashId || null,
     });
     bot.pending = null;
+    bot.awaitingBet = false;
+    bot.armedAtId = 0;
     bot.didPlaceInWindow = false;
     bot.lastSettleAt = Date.now();
     bot.settledGameId = crashId || (bot.lastGameItem && bot.lastGameItem.id) || 0;
@@ -667,10 +699,31 @@
     if (engine.state.mode === Mode.STOPPED) bot.betting = false;
   }
 
-  function observeRound(value) {
+  function observeRound(value, id) {
     if (!bot.betting) return;
+    if (engine.state.mode === Mode.SKIPPING) {
+      engine.onRoundObserved(value);
+      log(engine.state.message);
+      return;
+    }
+    if (bot.awaitingBet && !bot.pending) {
+      log(`Missed bet window at ${id || "?"} ${round2(value)}x — counting from this chip`);
+      bot.awaitingBet = false;
+      bot.armedAtId = 0;
+      engine.onRoundObserved(value);
+      log(engine.state.message);
+      if (engine.shouldBet()) {
+        bot.awaitingBet = true;
+        bot.armedAtId = id || bot.lastGameId;
+      }
+      return;
+    }
     engine.onRoundObserved(value);
     log(engine.state.message);
+    if (engine.shouldBet()) {
+      bot.awaitingBet = true;
+      bot.armedAtId = id || bot.lastGameId;
+    }
   }
 
   function watchBanner() {
@@ -763,7 +816,8 @@
       <div class="title">BC 4-Low Bot v${extVersion}</div>
       <div class="row"><span class="k">Betting</span><span class="v ${bot.betting ? "on" : "off"}">${bot.betting ? "ON" : "off"}</span></div>
       <div class="row"><span class="k">Mode</span><span class="v">${s.mode}</span></div>
-      <div class="row"><span class="k">Streak</span><span class="v">${s.low_streak}/${s.streak_needed}</span></div>
+      <div class="row"><span class="k">Streak</span><span class="v">${s.low_streak}/${s.streak_needed}${bot.awaitingBet ? " BET" : ""}</span></div>
+      <div class="row"><span class="k">Lows</span><span class="v">${(s.recent_crashes || []).slice(-4).map((v) => Number(v).toFixed(2)).join(" ") || "—"}</span></div>
       <div class="row"><span class="k">Skip</span><span class="v">${s.skip_remaining || 0}</span></div>
       <div class="row"><span class="k">Stake</span><span class="v">${bot.pending ? bot.pending.stake : s.current_stake}</span></div>
       <div class="row"><span class="k">Live</span><span class="v">${live != null ? live.toFixed(2) + "x" : "—"}</span></div>
@@ -786,20 +840,19 @@
       if (msg.type === "START_BET") {
         bot.betting = true;
         bot.placeAfter = 0;
-        engine.state.mode = Mode.WATCHING;
-        engine.state.low_streak = 0;
-        engine.state.skip_remaining = 0;
+        bot.pending = null;
+        applyBannerTailStreak();
         const bal = readBalance();
         if (bal != null && (engine.config.start_balance === 0 || engine.state.bets_placed === 0)) {
           engine.setStartBalance(bal);
         }
-        log("Betting ON — waiting for 4 consecutive lows < " + engine.config.low_below);
         tryPlace();
         sendResponse(status());
         return;
       }
       if (msg.type === "STOP_BET") {
         bot.betting = false;
+        bot.awaitingBet = false;
         log("Betting OFF");
         sendResponse(status());
         return;
@@ -816,6 +869,8 @@
         bot.betLog = [];
         bot.logs = [];
         bot.lastGameId = 0;
+        bot.awaitingBet = false;
+        bot.armedAtId = 0;
         engine.reset();
         const bal = readBalance();
         if (bal != null) engine.setStartBalance(bal);
