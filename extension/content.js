@@ -21,9 +21,10 @@
     dead: false,
     placing: false,
     tickBusy: false,
+    lastSettleAt: 0,
   };
 
-  let extVersion = "1.1.21";
+  let extVersion = "1.1.22";
   try {
     extVersion = chrome.runtime.getManifest().version;
   } catch (_) {}
@@ -224,6 +225,15 @@
     return { ok: false, why: `amount-mismatch ${final} != ${want}` };
   }
 
+  function parseMultText(text) {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    const m = t.match(/^(\d+(?:\.\d+)?)\s*[x×]$/i);
+    if (!m) return null;
+    const v = parseFloat(m[1]);
+    if (!Number.isFinite(v) || v < 1 || v >= 1e6) return null;
+    return v;
+  }
+
   function readCountdown() {
     const t = (document.body && document.body.innerText || "").toLowerCase();
     const m =
@@ -243,15 +253,13 @@
   function readLiveMult() {
     const cashout = Number(engine.config.cashout) || 1.45;
     let best = null;
-    const els = document.querySelectorAll("div, span");
+    const els = document.querySelectorAll("div, span, b, p, h1, h2");
     for (const el of els) {
       if (el.offsetParent === null) continue;
-      const t = (el.innerText || "").trim();
-      if (!/^\d+\.\d{2}x$/i.test(t)) continue;
+      const v = parseMultText(el.innerText || "");
+      if (v == null) continue;
       const r = el.getBoundingClientRect();
-      if (r.width < 48 || r.height < 28 || r.top < 80) continue;
-      const v = parseFloat(t);
-      if (v < 1) continue;
+      if (r.width < 40 || r.height < 22 || r.top < 70) continue;
       const area = r.width * r.height;
       if (Math.abs(v - cashout) < 0.021 && area < 14000) continue;
       if (!best || area > best.area) best = { v, area };
@@ -259,51 +267,72 @@
     return best ? best.v : null;
   }
 
+  function readCenterBust() {
+    const cashout = Number(engine.config.cashout) || 1.45;
+    const midX = window.innerWidth / 2;
+    let best = null;
+    const els = document.querySelectorAll("div, span, b, p, h1, h2, strong");
+    for (const el of els) {
+      if (el.offsetParent === null) continue;
+      const v = parseMultText((el.innerText || "").trim());
+      if (v == null || v + 1e-9 >= cashout) continue;
+      const r = el.getBoundingClientRect();
+      if (r.top < 70 || r.top > window.innerHeight * 0.72) continue;
+      if (r.width < 36 || r.height < 20) continue;
+      const area = r.width * r.height;
+      if (area < 900) continue;
+      const dist = Math.abs(r.left + r.width / 2 - midX);
+      if (!best || area > best.area || (area === best.area && dist < best.dist)) {
+        best = { v, area, dist };
+      }
+    }
+    return best ? best.v : null;
+  }
+
   function readChips() {
-    const xRe = /^(\d+\.\d+)\s*[x×]$/i;
+    const xRe = /^(\d+(?:\.\d+)?)\s*[x×]$/i;
     const idRe = /^(\d{5,10})$/;
     const cash2 = round2(engine.config.cashout);
     const found = new Map();
-    const els = document.querySelectorAll("div, span, a, p, b");
+    const els = document.querySelectorAll("div, span, a, p, b, strong");
     for (const el of els) {
       if (el.offsetParent === null) continue;
       if (el.closest("input,label,form,textarea,[role='dialog']")) continue;
       const raw = (el.innerText || "").trim();
-      if (!raw || raw.length > 48) continue;
+      if (!raw || raw.length > 56) continue;
       const r = el.getBoundingClientRect();
-      if (r.top < 0 || r.top > 160 || r.height > 64 || r.width < 6 || r.width > 180) continue;
+      if (r.bottom < 0 || r.top > 220 || r.height > 72 || r.width < 4 || r.width > 220) continue;
       const t = raw.replace(/\s+/g, " ");
       let id = null;
       let v = null;
-      let mm = t.match(/^(\d{5,10})\s+(\d+\.\d+)\s*[x×]$/i);
+      let mm = t.match(/^(\d{5,10})\s+(\d+(?:\.\d+)?)\s*[x×]$/i);
       if (mm) {
         id = Number(mm[1]);
         v = parseFloat(mm[2]);
-      } else if (xRe.test(t) && el.children.length === 0) {
-        v = parseFloat(t);
+      } else if (xRe.test(t) && el.childElementCount <= 3) {
+        v = parseMultText(t);
         let sib = el.previousElementSibling;
-        for (let i = 0; i < 5 && sib && !id; i++) {
+        for (let i = 0; i < 6 && sib && !id; i++) {
           if (idRe.test((sib.innerText || "").trim())) id = Number((sib.innerText || "").trim());
           sib = sib.previousElementSibling;
         }
         if (!id) {
           const p = el.parentElement;
           const pt = p ? (p.innerText || "").replace(/\s+/g, " ").trim() : "";
-          if (p && pt.length <= 40) {
-            const pm = pt.match(/^(\d{5,10})\s+(\d+\.\d+)\s*[x×]$/i) || pt.match(/(\d{5,10})/);
+          if (p && pt.length <= 48) {
+            const pm = pt.match(/^(\d{5,10})\s+(\d+(?:\.\d+)?)\s*[x×]$/i) || pt.match(/(\d{5,10})/);
             if (pm) id = Number(pm[1]);
           }
         }
-      } else if (idRe.test(t) && el.children.length === 0) {
+      } else if (idRe.test(t) && el.childElementCount <= 3) {
         id = Number(t);
         let sib = el.nextElementSibling;
-        for (let i = 0; i < 5 && sib && v == null; i++) {
-          const xm = (sib.innerText || "").trim().match(xRe);
-          if (xm) v = parseFloat(xm[1]);
+        for (let i = 0; i < 6 && sib && v == null; i++) {
+          v = parseMultText((sib.innerText || "").trim());
           sib = sib.nextElementSibling;
         }
       }
-      if (id && v >= 1 && v < 1e6) {
+      if (id && v != null && v >= 1 && v < 1e6) {
         const prev = found.get(id);
         const area = r.width * r.height;
         const cashish = Math.abs(round2(v) - cash2) <= 0.03;
@@ -311,7 +340,9 @@
           found.set(id, { id, v, area, cashish });
         } else if (prev.cashish && !cashish) {
           found.set(id, { id, v, area, cashish });
-        } else if (prev.cashish === cashish && area < prev.area) {
+        } else if (!prev.cashish && cashish) {
+          /* keep real crash, ignore 1.45 cashout label */
+        } else if (area < prev.area) {
           found.set(id, { id, v, area, cashish });
         }
       }
@@ -505,7 +536,7 @@
         }
       }
     } catch (_) {}
-    const m = text.match(/(\d+\.\d{2})\s*x/i);
+    const m = text.match(/(\d+(?:\.\d+)?)\s*[x×]/i);
     if (m) nums.push(parseFloat(m[1]));
     return nums.length ? nums[nums.length - 1] : null;
   }
@@ -624,6 +655,13 @@
       bot.pending.gameId = instant.id;
       bot.pending.gameCrash = instant.v;
       settle();
+    } else {
+      const bust = readCenterBust();
+      if (bust != null) {
+        bot.pending.gameId = pendingMinId(bot.pending) + 1;
+        bot.pending.gameCrash = bust;
+        settle();
+      }
     }
   }
 
@@ -680,6 +718,23 @@
     }
 
     if (crash == null) {
+      const bust = readCenterBust();
+      if (
+        bust != null &&
+        bust + 1e-9 < cash2 &&
+        age >= 0.04 &&
+        Date.now() - (bot.lastSettleAt || 0) > 280
+      ) {
+        crash = bust;
+        crashId = p.gameId || pendingMinId(p) + 1;
+      }
+    }
+    if (crash == null && p.wsCrash != null && p.wsCrash + 1e-9 < cash2 && age > 0.05) {
+      crash = p.wsCrash;
+      crashId = p.gameId || pendingMinId(p) + 1;
+    }
+
+    if (crash == null) {
       if (age >= 180) {
         log("Settle timeout — no crash result after 180s, dropped pending");
         bot.pending = null;
@@ -708,6 +763,7 @@
     });
     bot.pending = null;
     bot.didPlaceInWindow = false;
+    bot.lastSettleAt = Date.now();
     bot.settledGameId = crashId || (bot.lastGameItem && bot.lastGameItem.id) || 0;
     bot.placeAfter = Date.now() + (won ? 80 : 0);
     if (engine.state.mode === Mode.RESTING) bot.lastRestGameId = bot.settledGameId;
