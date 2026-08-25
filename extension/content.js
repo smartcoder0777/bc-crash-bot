@@ -22,9 +22,12 @@
     placing: false,
     tickBusy: false,
     lastSettleAt: 0,
+    bannerObs: null,
+    lastGameId: 0,
+    liveTimer: null,
   };
 
-  let extVersion = "1.1.24";
+  let extVersion = "1.1.26";
   try {
     extVersion = chrome.runtime.getManifest().version;
   } catch (_) {}
@@ -46,6 +49,10 @@
     if (tickTimer) {
       clearInterval(tickTimer);
       tickTimer = null;
+    }
+    if (bot.liveTimer) {
+      clearInterval(bot.liveTimer);
+      bot.liveTimer = null;
     }
     window.__bcCrashBotLoaded = false;
   }
@@ -267,45 +274,101 @@
     return best ? best.v : null;
   }
 
-  function bannerRoots() {
-    const out = [];
-    const seen = new Set();
-    const add = (el) => {
-      if (!el || seen.has(el)) return;
-      seen.add(el);
-      out.push(el);
-    };
-    add(document.getElementById("crash-banner"));
-    document.querySelectorAll("[id*='crash-banner' i], [class*='crash-banner' i]").forEach(add);
-    return out;
+  function findRecentList(doc) {
+    const d = doc || document;
+    return (
+      d.querySelector("div#crash-banner > div > div.grid") ||
+      d.querySelector("#crash-banner .grid") ||
+      d.querySelector('[id*="crash-banner"] .grid') ||
+      d.querySelector("#crash-banner")
+    );
+  }
+
+  function parseChip(el) {
+    if (!el) return null;
+    const block = el.querySelector ? el.querySelector("span.flex.flex-col") || el : el;
+    const spans = block.querySelectorAll ? block.querySelectorAll("span") : [];
+    let gameId = 0;
+    let gameValue = NaN;
+    if (spans.length >= 2) {
+      gameId = parseInt(spans[0].textContent, 10);
+      gameValue = parseFloat(String(spans[1].textContent).replace(/x/i, ""));
+    }
+    if (!gameId || !(gameValue > 0)) {
+      const text = String(el.textContent || "").replace(/\s+/g, " ");
+      const match = text.match(/(\d{6,})\D+([\d.]+)/);
+      if (match) {
+        gameId = parseInt(match[1], 10);
+        gameValue = parseFloat(match[2]);
+      }
+    }
+    if (!gameId || !(gameValue > 0)) return null;
+    return { id: gameId, v: Number(gameValue.toFixed(2)), value: Number(gameValue.toFixed(2)), area: 1, cashish: false };
   }
 
   function collectBannerGames() {
-    const found = new Map();
-    const add = (id, v) => {
-      const gid = Number(id);
-      const crash = parseFloat(String(v).replace(/[x×]/gi, "").trim());
-      if (!gid || gid < 1e5 || !Number.isFinite(crash) || crash < 1 || crash >= 1e6) return;
-      found.set(gid, { id: gid, v: crash, area: 1, cashish: false });
+    const seen = {};
+    const games = [];
+    const add = (parsed) => {
+      if (!parsed || seen[parsed.id]) return;
+      seen[parsed.id] = true;
+      games.push(parsed);
     };
-    for (const root of bannerRoots()) {
-      root.querySelectorAll("span.flex.flex-col, [class*='flex-col']").forEach((chip) => {
-        const spans = [...chip.querySelectorAll(":scope > span, span")].filter((s) => {
-          const t = (s.innerText || "").replace(/\s+/g, " ").trim();
-          return t && t.length < 24;
-        });
-        if (spans.length >= 2) {
-          const idTxt = (spans[0].innerText || "").trim();
-          const valTxt = (spans[1].innerText || "").trim();
-          if (/^\d{6,}$/.test(idTxt) && /(\d+(?:\.\d+)?)/.test(valTxt)) add(idTxt, valTxt);
-        }
+    const scanDoc = (doc) => {
+      const roots = [];
+      const recentList = findRecentList(doc);
+      if (recentList) roots.push(recentList);
+      const banner = doc.querySelector("#crash-banner");
+      if (banner && banner !== recentList) roots.push(banner);
+      roots.forEach((root) => {
+        Array.from(root.querySelectorAll("span.flex.flex-col")).forEach((el) => add(parseChip(el)));
+        Array.from(root.children || []).forEach((el) => add(parseChip(el)));
       });
-      const blob = (root.innerText || "").replace(/\s+/g, " ");
-      const re = /(\d{6,})\D+?(\d+(?:\.\d+)?)\s*[x×]?/gi;
-      let m;
-      while ((m = re.exec(blob))) add(m[1], m[2]);
+    };
+    scanDoc(document);
+    try {
+      document.querySelectorAll("iframe").forEach((frame) => {
+        try {
+          if (frame.contentDocument) scanDoc(frame.contentDocument);
+        } catch (_) {}
+      });
+    } catch (_) {}
+    return games.sort((a, b) => a.id - b.id);
+  }
+
+  function onNewBannerGame(id, value) {
+    bot.lastGameItem = { id, crash: value, ts: Date.now() };
+    const p = bot.pending;
+    if (!p) {
+      applyRestRound(id);
+      return;
     }
-    return [...found.values()].sort((a, b) => a.id - b.id).slice(-24);
+    if (id <= pendingMinId(p)) return;
+    p.gameId = id;
+    p.gameCrash = value;
+    p.sawRound = true;
+    settle();
+  }
+
+  function sendGameValueUpdates() {
+    const games = collectBannerGames();
+    if (!games.length) return;
+    if (!bot.lastGameId) {
+      bot.lastGameId = games[games.length - 1].id;
+      return;
+    }
+    for (let i = 0; i < games.length; i++) {
+      const g = games[i];
+      if (!g.id || g.id <= bot.lastGameId) continue;
+      bot.lastGameId = g.id;
+      onNewBannerGame(g.id, g.v);
+    }
+  }
+
+  function startLiveUpdates() {
+    if (bot.liveTimer) return;
+    sendGameValueUpdates();
+    bot.liveTimer = setInterval(sendGameValueUpdates, 200);
   }
 
   function readChipsFallback() {
@@ -596,9 +659,6 @@
       return;
     }
     if (id <= pendingMinId(p)) return;
-    const cash2 = round2(p.cashout || engine.config.cashout);
-    const live = engine.state.last_multiplier_seen;
-    if (crash + 1e-9 < cash2 && live != null && live > 1.12 && live > crash + 0.05) return;
     const oldest = oldestNewChip(p);
     if (oldest) {
       p.gameId = oldest.id;
@@ -716,25 +776,12 @@
 
     let crash = null;
     let crashId = null;
-    if (next) {
-      const live = engine.state.last_multiplier_seen;
-      const leftoverBust =
-        next.v + 1e-9 < cash2 &&
-        live != null &&
-        live > 1.12 &&
-        live > next.v + 0.05;
-      if (!leftoverBust) {
-        crash = next.v;
-        crashId = next.id;
-        if (
-          p.gameId === next.id &&
-          p.gameCrash != null &&
-          Math.abs(round2(next.v) - cash2) <= 0.03 &&
-          Math.abs(round2(p.gameCrash) - cash2) > 0.03
-        ) {
-          crash = p.gameCrash;
-        }
-      }
+    if (p.gameId && p.gameCrash != null && p.gameId > pendingMinId(p)) {
+      crash = p.gameCrash;
+      crashId = p.gameId;
+    } else if (next) {
+      crash = next.v;
+      crashId = next.id;
     } else if (p.gameId === expected && p.gameCrash != null) {
       crash = p.gameCrash;
       crashId = p.gameId;
@@ -787,6 +834,36 @@
     return true;
   }
 
+  function watchBanner() {
+    if (bot.bannerObs || bot.dead) return;
+    const roots = [];
+    const add = (el) => {
+      if (el && roots.indexOf(el) < 0) roots.push(el);
+    };
+    add(findRecentList(document));
+    add(document.querySelector("#crash-banner"));
+    try {
+      document.querySelectorAll("iframe").forEach((frame) => {
+        try {
+          const doc = frame.contentDocument;
+          if (!doc) return;
+          add(findRecentList(doc));
+          add(doc.querySelector("#crash-banner"));
+        } catch (_) {}
+      });
+    } catch (_) {}
+    if (!roots.length) return;
+    bot.bannerObs = new MutationObserver(() => {
+      if (!extAlive()) return;
+      sendGameValueUpdates();
+    });
+    roots.forEach((root) => {
+      try {
+        bot.bannerObs.observe(root, { childList: true, subtree: true, characterData: true });
+      } catch (_) {}
+    });
+  }
+
   function tickRest() {
     if (engine.state.mode !== Mode.RESTING || bot.pending) return;
     const minId = bot.lastRestGameId || bot.settledGameId || 0;
@@ -819,6 +896,7 @@
 
       snapshotHistory();
       if (bot.pending) settle();
+      watchBanner();
       tickRest();
       if (canPlace()) tryPlace();
 
@@ -910,6 +988,7 @@
         bot.pending = null;
         bot.betLog = [];
         bot.logs = [];
+        bot.lastGameId = 0;
         engine.reset();
         const bal = readBalance();
         if (bal != null) engine.setStartBalance(bal);
@@ -925,6 +1004,7 @@
       if (bal != null) engine.setStartBalance(bal);
       renderOverlay();
       log("Ready on crash page. Click Start bet in the extension popup.");
+      startLiveUpdates();
     });
 
     tickTimer = setInterval(tick, 120);
