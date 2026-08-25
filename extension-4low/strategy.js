@@ -36,7 +36,7 @@
       last_result: "-",
       last_crash: null,
       last_multiplier_seen: null,
-      message: "Idle — watching for 4 lows under 1.45",
+      message: "Idle — wait for 4 lows < 1.45, then bet immediately @ 1.9x",
       history: [],
     };
   }
@@ -66,7 +66,7 @@
       }
       const need = Number(cfg.streak_needed) || 4;
       if (st.low_streak >= need) {
-        st.message = `${st.low_streak}/${need} lows < ${cfg.low_below} — bet ${cfg.stake} @ ${cfg.cashout}x next round`;
+        st.message = `${st.low_streak}/${need} lows < ${cfg.low_below} — betting now (${cfg.stake} @ ${cfg.cashout}x)`;
       } else {
         st.message = `Watching lows < ${cfg.low_below}: ${st.low_streak}/${need}`;
       }
@@ -124,7 +124,7 @@
       this.config.start_balance = 0;
       this.state = defaultState();
       this._syncMessage();
-      this.state.message = "Reset — watching for 4 lows";
+      this.state.message = "Reset — wait for 4 lows, then bet immediately";
     }
 
     shouldBet() {
