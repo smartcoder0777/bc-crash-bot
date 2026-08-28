@@ -2,16 +2,20 @@
   function boot() {
     if (window.__bcCrash4LowLoaded) return;
 
-    const engine = new StrategyEngine(defaultConfig());
+    let botConfig = defaultBotConfig();
+    const streakEngine = new StrategyEngine(botConfig.streak_low);
+    const sgEngine = new SingleGreenEngine(botConfig.single_green);
+
   const bot = {
     betting: false,
     pending: null,
+    armedStrategy: null,
     lastPhase: "unknown",
     lastCd: null,
     roundSeq: 0,
     siteMessage: "Extension loaded. Open the popup and click Start bet.",
-    logs: [],
-    betLog: [],
+    logs: { streak_low: [], single_green: [], system: [] },
+    betLog: { streak_low: [], single_green: [] },
     lastPlaceFail: 0,
     didPlaceInWindow: false,
     lastGameItem: null,
@@ -28,9 +32,10 @@
     awaitingBet: false,
     armedAtId: 0,
     placePump: null,
+    verifying: null,
   };
 
-  let extVersion = "1.0.3";
+  let extVersion = "1.1.3";
   try {
     extVersion = chrome.runtime.getManifest().version;
   } catch (_) {}
@@ -49,6 +54,7 @@
     if (bot.dead) return;
     bot.dead = true;
     bot.betting = false;
+    syncBettingFlag();
     if (tickTimer) {
       clearInterval(tickTimer);
       tickTimer = null;
@@ -61,21 +67,70 @@
     window.__bcCrash4LowLoaded = false;
   }
 
-  function log(msg) {
+  function isEnabled(key) {
+    if (key === "streak_low") return botConfig.enabled_streak_low !== false;
+    if (key === "single_green") return !!botConfig.enabled_single_green;
+    return false;
+  }
+
+  function engineFor(key) {
+    return key === "single_green" ? sgEngine : streakEngine;
+  }
+
+  function combinedPnl() {
+    let p = 0;
+    if (isEnabled("streak_low")) p += Number(streakEngine.state.session_pnl) || 0;
+    if (isEnabled("single_green")) p += Number(sgEngine.state.session_pnl) || 0;
+    return p;
+  }
+
+  function anyStrategyStopped() {
+    if (isEnabled("streak_low") && streakEngine.state.mode === Mode.STOPPED) return true;
+    if (isEnabled("single_green") && sgEngine.state.mode === SgMode.STOPPED) return true;
+    return false;
+  }
+
+  function activeStrategies() {
+    const out = [];
+    if (isEnabled("streak_low") && streakEngine.state.mode !== Mode.STOPPED) out.push("streak_low");
+    if (isEnabled("single_green") && sgEngine.state.mode !== SgMode.STOPPED) out.push("single_green");
+    return out;
+  }
+
+  function pickBetIntent() {
+    const intents = [];
+    if (isEnabled("streak_low") && streakEngine.state.mode !== Mode.STOPPED && streakEngine.shouldBet()) {
+      const bet = streakEngine.nextBet();
+      if (bet) intents.push({ key: "streak_low", bet });
+    }
+    if (isEnabled("single_green") && sgEngine.state.mode !== SgMode.STOPPED && sgEngine.shouldBet()) {
+      const bet = sgEngine.nextBet();
+      if (bet) intents.push({ key: "single_green", bet });
+    }
+    if (intents.length > 1) {
+      log(`Both strategies armed — using ${intents[0].key}`, "system");
+    }
+    return intents[0] || null;
+  }
+
+  function log(msg, channel) {
+    const key = channel === "streak_low" || channel === "single_green" ? channel : "system";
+    const prefix = key === "streak_low" ? "4-Low" : key === "single_green" ? "SG" : "Bot";
     const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
-    bot.logs.push(line);
-    if (bot.logs.length > 80) bot.logs.shift();
-    bot.siteMessage = msg;
-    console.log("[BC 4-Low]", msg);
+    bot.logs[key].push(line);
+    if (bot.logs[key].length > 80) bot.logs[key].shift();
+    bot.siteMessage = `[${prefix}] ${msg}`;
+    console.log(`[BC ${prefix}]`, msg);
     renderOverlay();
   }
 
-  function pushBetLog(entry) {
-    bot.betLog.push({
+  function pushBetLog(entry, strategy) {
+    const key = strategy === "single_green" ? "single_green" : "streak_low";
+    bot.betLog[key].push({
       t: new Date().toLocaleTimeString(),
       ...entry,
     });
-    if (bot.betLog.length > 150) bot.betLog.shift();
+    if (bot.betLog[key].length > 150) bot.betLog[key].shift();
   }
 
   function inHeader(el) {
@@ -145,6 +200,54 @@
       .filter((b) => isMainBetLabel(normText(b)))
       .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
     return ranked[0] || null;
+  }
+
+  function syncBettingFlag() {
+    try {
+      chrome.storage.local.set({ betting_enabled: !!bot.betting });
+      chrome.runtime.sendMessage({ type: bot.betting ? "BETTING_ON" : "BETTING_OFF" });
+    } catch (_) {}
+  }
+
+  function syncAwaitingFlag() {
+    try {
+      chrome.storage.local.set({ awaiting_bet: !!bot.awaitingBet });
+      chrome.runtime.sendMessage({ type: "AWAITING_BET", value: !!bot.awaitingBet });
+    } catch (_) {}
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function isMainPlacedBet() {
+    const limit = sideBetLeft();
+    for (const b of allBetControls()) {
+      if (!visible(b)) continue;
+      const r = b.getBoundingClientRect();
+      if (r.left >= limit) continue;
+      const t = normText(b).toLowerCase();
+      if (/\bcancel\b/.test(t) && (/\bbet\b/.test(t) || t.length < 16)) return true;
+      if (/\bplaced\b/.test(t) && /\bbet\b/.test(t)) return true;
+    }
+    return false;
+  }
+
+  async function waitForBetVerified(stake, balBefore, timeoutMs) {
+    const want = round8(stake);
+    const deadline = Date.now() + (timeoutMs || 3500);
+    while (Date.now() < deadline) {
+      if (isMainPlacedBet()) return { ok: true };
+      if (!findMainBetButton() && isMainPlacedBet()) return { ok: true };
+      if (balBefore != null) {
+        const bal = readBalance();
+        if (bal != null && bal < balBefore - want * 0.85 + 1e-6) {
+          return { ok: true, balance: bal };
+        }
+      }
+      await sleep(120);
+    }
+    return { ok: false, why: "verify-timeout" };
   }
 
   function dismissCookies() {
@@ -262,7 +365,12 @@
   }
 
   function readLiveMult() {
-    const cashout = Number(engine.config.cashout) || 1.45;
+    const cashout = bot.pending
+      ? Number(bot.pending.cashout) || 2
+      : Math.max(
+          Number(streakEngine.config.cashout) || 1.9,
+          Number(sgEngine.config.cashout) || 2
+        );
     let best = null;
     const els = document.querySelectorAll("div, span, b, p, h1, h2");
     for (const el of els) {
@@ -354,13 +462,13 @@
         settle();
         return;
       }
-      log(`Banner gap ${expected} → ${id} ${value}x — pending counted as lose`);
+      log(`Banner gap ${expected} → ${id} ${value}x — pending counted as lose`, p.strategy || "streak_low");
       p.gameId = expected;
       p.gameCrash = 1;
       p.sawRound = true;
       bot.awaitingBet = false;
       settle();
-      if (engine.state.mode === Mode.SKIPPING) observeRound(value, id);
+      if (p.strategy === "streak_low" && streakEngine.state.mode === Mode.SKIPPING) observeRound(value, id);
       return;
     }
     observeRound(value, id);
@@ -385,7 +493,7 @@
 
   function bannerTailLows() {
     const games = collectBannerGames();
-    const low = Number(engine.config.low_below) || 1.45;
+    const low = Number(streakEngine.config.low_below) || 1.45;
     const tail = [];
     for (let i = games.length - 1; i >= 0; i--) {
       const v = round2(games[i].v);
@@ -401,15 +509,26 @@
       const newest = games[games.length - 1].id;
       if (!bot.lastGameId || newest > bot.lastGameId) bot.lastGameId = newest;
     }
-    engine.setWatchingStreak(tail.length, tail);
+    if (isEnabled("streak_low")) {
+      streakEngine.setWatchingStreak(tail.length, tail);
+    }
+    if (isEnabled("single_green")) {
+      sgEngine.replayGames(games.map((g) => ({ id: g.id, value: g.v })));
+    }
     bot.awaitingBet = false;
+    bot.armedStrategy = null;
     bot.armedAtId = 0;
-    if (bot.betting && engine.shouldBet() && games.length) {
-      armBet(games[games.length - 1].id);
+    if (bot.betting) {
+      const intent = pickBetIntent();
+      if (intent && games.length) {
+        bot.armedStrategy = intent.key;
+        armBet(games[games.length - 1].id);
+      }
     }
     const shown = tail.length ? tail.map((v) => v.toFixed(2)).join("  ") : "—";
-    const need = Number(engine.config.streak_needed) || 4;
-    log(`Banner lows ${tail.length}/${need} [${shown}]${bot.awaitingBet ? " — betting now" : ""}`);
+    const need = Number(streakEngine.config.streak_needed) || 4;
+    log(`Banner lows ${tail.length}/${need} [${shown}]`, "streak_low");
+    if (isEnabled("single_green")) log(sgEngine.state.message, "single_green");
   }
 
   function startLiveUpdates() {
@@ -483,14 +602,31 @@
 
   function syncStartFromWallet(bal) {
     if (bal == null) return;
-    const start = Number(engine.config.start_balance) || 0;
-    const book = start + engine.state.session_pnl;
+    const combined = combinedPnl();
+    const start =
+      (Number(streakEngine.config.start_balance) || 0) +
+      (Number(sgEngine.config.start_balance) || 0);
+    const book = start + combined;
     if (start === 0) {
-      engine.setStartBalance(bal);
+      const half = bal / (activeStrategies().length || 1);
+      if (isEnabled("streak_low")) streakEngine.setStartBalance(half);
+      if (isEnabled("single_green")) sgEngine.setStartBalance(bal - half);
       return;
     }
     if (bal > book + 0.05) {
-      engine.setStartBalance(Math.round((bal - engine.state.session_pnl) * 1e8) / 1e8);
+      const delta = bal - combined;
+      const n = activeStrategies().length || 1;
+      const each = Math.round((delta / n) * 1e8) / 1e8;
+      if (isEnabled("streak_low")) {
+        streakEngine.setStartBalance(
+          Math.round((each - streakEngine.state.session_pnl) * 1e8) / 1e8
+        );
+      }
+      if (isEnabled("single_green")) {
+        sgEngine.setStartBalance(
+          Math.round((each - sgEngine.state.session_pnl) * 1e8) / 1e8
+        );
+      }
     }
   }
 
@@ -588,9 +724,13 @@
   }
 
   function canPlace() {
-    if (!bot.betting || bot.pending || bot.dead || bot.placing) return false;
-    if (engine.state.mode === Mode.SKIPPING || engine.state.mode === Mode.STOPPED) return false;
-    if (!bot.awaitingBet || !engine.shouldBet()) return false;
+    if (!bot.betting || bot.pending || bot.dead || bot.placing || bot.verifying) return false;
+    if (!bot.awaitingBet || !bot.armedStrategy) return false;
+    const eng = engineFor(bot.armedStrategy);
+    if (bot.armedStrategy === "streak_low") {
+      if (streakEngine.state.mode === Mode.SKIPPING || streakEngine.state.mode === Mode.STOPPED) return false;
+    } else if (sgEngine.state.mode === SgMode.STOPPED) return false;
+    if (!eng.shouldBet()) return false;
     if (!bot.lastGameId) return false;
     if (Date.now() < (bot.placeAfter || 0)) return false;
     const games = collectBannerGames();
@@ -598,10 +738,12 @@
     return betButtonReady();
   }
 
-  function armBet(id) {
+  function armBet(id, strategy) {
     bot.awaitingBet = true;
+    bot.armedStrategy = strategy || bot.armedStrategy || pickBetIntent()?.key || "streak_low";
     bot.armedAtId = id || bot.lastGameId;
     bot.placeAfter = 0;
+    syncAwaitingFlag();
     startPlacePump();
     tryPlace();
   }
@@ -609,8 +751,8 @@
   function startPlacePump() {
     if (bot.placePump) return;
     bot.placePump = setInterval(() => {
-      if (!extAlive() || !bot.betting || !bot.awaitingBet || bot.pending) {
-        if (!bot.awaitingBet || bot.pending || !bot.betting) stopPlacePump();
+      if (!extAlive() || !bot.betting || !bot.awaitingBet || bot.pending || bot.verifying) {
+        if (!bot.awaitingBet || bot.pending || bot.verifying || !bot.betting) stopPlacePump();
         return;
       }
       tryPlace();
@@ -623,31 +765,39 @@
     bot.placePump = null;
   }
 
-  function tryPlace() {
+  async function tryPlace() {
+    if (bot.verifying || bot.placing) return;
     if (!canPlace()) return;
-    if (engine.state.mode === Mode.STOPPED) {
-      bot.betting = false;
-      log(engine.state.message);
+    const strat = bot.armedStrategy || "streak_low";
+    const eng = engineFor(strat);
+    if (
+      (strat === "streak_low" && streakEngine.state.mode === Mode.STOPPED) ||
+      (strat === "single_green" && sgEngine.state.mode === SgMode.STOPPED)
+    ) {
+      if (!activeStrategies().length) bot.betting = false;
+      log(eng.state.message, strat);
       return;
     }
-    const nxt = engine.nextBet();
+    const nxt = eng.nextBet();
     if (!nxt) {
-      log(engine.state.message);
+      log(eng.state.message, strat);
       return;
     }
     const bal = readBalance();
     if (bal != null && nxt.stake > bal + 1e-9) {
-      engine._stop(`Can't afford next stake ${nxt.stake} (balance ${bal}) — bot stopped`);
-      bot.betting = false;
+      eng._stop(`Can't afford next stake ${nxt.stake} (balance ${bal}) — strategy stopped`);
       bot.awaitingBet = false;
+      bot.armedStrategy = null;
       stopPlacePump();
-      log(engine.state.message);
+      log(eng.state.message, strat);
+      if (!activeStrategies().length) bot.betting = false;
       return;
     }
     const lockId = bot.armedAtId || bot.lastGameId;
     if (!lockId) return;
     bot.placing = true;
     bot.pending = {
+      strategy: strat,
       stake: nxt.stake,
       cashout: nxt.cashout,
       placedAt: Date.now(),
@@ -659,29 +809,42 @@
     };
     const pendingRef = bot.pending;
     const placed = placeBet(nxt.stake, nxt.cashout);
-    bot.placing = false;
     if (!placed.ok) {
+      bot.placing = false;
       if (bot.pending === pendingRef) bot.pending = null;
       const soft = placed.why === "no-bet-button" || placed.why === "no-enabled-input";
       if (!soft) bot.lastPlaceFail = Date.now();
       if (!bot.lastPlaceFailLog || Date.now() - bot.lastPlaceFailLog > 2000) {
         bot.lastPlaceFailLog = Date.now();
-        log(`place_bet fail: ${placed.why}`);
+        log(`place_bet fail: ${placed.why}`, strat);
+      }
+      return;
+    }
+    bot.verifying = true;
+    const verified = await waitForBetVerified(nxt.stake, bal, document.hidden ? 5000 : 3500);
+    bot.verifying = false;
+    bot.placing = false;
+    if (!verified.ok) {
+      if (bot.pending === pendingRef) bot.pending = null;
+      if (!bot.lastPlaceFailLog || Date.now() - bot.lastPlaceFailLog > 3000) {
+        bot.lastPlaceFailLog = Date.now();
+        log(`Bet click not confirmed on site${document.hidden ? " (tab hidden)" : ""} — will retry`, strat);
       }
       return;
     }
     const actual = Number.isFinite(placed.amount) ? round8(placed.amount) : nxt.stake;
     if (bot.pending === pendingRef) {
       if (!nearStake(actual, nxt.stake)) {
-        log(`Stake snapped to ${actual} (wanted ${nxt.stake})`);
+        log(`Stake snapped to ${actual} (wanted ${nxt.stake})`, strat);
       }
       bot.pending.stake = actual;
     }
     bot.didPlaceInWindow = true;
     bot.awaitingBet = false;
+    syncAwaitingFlag();
     stopPlacePump();
-    log(`Bet ${actual} @ ${nxt.cashout}x placed (${placed.label || "main bet"} amt=${placed.amount ?? actual})`);
-    pushBetLog({ kind: "bet", stake: actual, cashout: nxt.cashout });
+    log(`Bet ${actual} @ ${nxt.cashout}x confirmed (${placed.label || "main bet"})`, strat);
+    pushBetLog({ kind: "bet", stake: actual, cashout: nxt.cashout }, strat);
   }
 
   function pendingMinId(p) {
@@ -696,7 +859,7 @@
 
     if (p.gameId == null || p.gameCrash == null) {
       if (age >= 180) {
-        log("Settle timeout — no crash result after 180s, dropped pending");
+        log("Settle timeout — no crash result after 180s, dropped pending", p.strategy || "streak_low");
         bot.pending = null;
       }
       return;
@@ -707,49 +870,92 @@
     const crash2 = round2(crash);
     const won = !(crash2 + 1e-9 < cash2);
 
+    const strat = p.strategy || "streak_low";
+    const eng = engineFor(strat);
     const source = `${crashId || "?"} ${crash2}x ${won ? ">=" : "<"} ${cash2}x`;
-    engine.onBetResult(won, p.stake, crash);
-    log(`${won ? "Win" : "Lose"} (${source}) | ${engine.state.message}`);
-    const last = engine.state.history[engine.state.history.length - 1];
-    pushBetLog({
-      kind: won ? "win" : "lose",
-      stake: p.stake,
-      profit: last ? last.profit : won ? round8(p.stake * (p.cashout - 1)) : round8(-p.stake),
-      crash: crash2,
-      crashId: crashId || null,
-    });
+    eng.onBetResult(won, p.stake, crash);
+    log(`${won ? "Win" : "Lose"} (${source}) | ${eng.state.message}`, strat);
+    const last = eng.state.history[eng.state.history.length - 1];
+    pushBetLog(
+      {
+        kind: won ? "win" : "lose",
+        stake: p.stake,
+        profit: last ? last.profit : won ? round8(p.stake * (p.cashout - 1)) : round8(-p.stake),
+        crash: crash2,
+        crashId: crashId || null,
+      },
+      strat
+    );
     bot.pending = null;
     bot.awaitingBet = false;
+    bot.armedStrategy = null;
     bot.armedAtId = 0;
     stopPlacePump();
     bot.didPlaceInWindow = false;
     bot.lastSettleAt = Date.now();
     bot.settledGameId = crashId || (bot.lastGameItem && bot.lastGameItem.id) || 0;
     bot.placeAfter = 0;
-    if (engine.state.mode === Mode.STOPPED) bot.betting = false;
+    if (!activeStrategies().length) bot.betting = false;
+  }
+
+  function handleMissedRound(value, id) {
+    const strat = bot.armedStrategy || "streak_low";
+    log(`Missed round at ${id || "?"} ${round2(value)}x — not betting the following one`, strat);
+    bot.awaitingBet = false;
+    syncAwaitingFlag();
+    bot.armedAtId = 0;
+    bot.armedStrategy = null;
+    stopPlacePump();
+    if (strat === "streak_low") streakEngine.setWatchingStreak(0);
+    else sgEngine.onMissedBet();
+    if (isEnabled("streak_low")) {
+      streakEngine.onRoundObserved(value);
+      log(streakEngine.state.message, "streak_low");
+    }
+    if (isEnabled("single_green")) {
+      sgEngine.onRoundObserved(value, id);
+      log(sgEngine.state.message, "single_green");
+    }
+    const intent = pickBetIntent();
+    if (intent) {
+      bot.armedStrategy = intent.key;
+      armBet(id || bot.lastGameId, intent.key);
+    }
   }
 
   function observeRound(value, id) {
     if (!bot.betting) return;
-    if (engine.state.mode === Mode.SKIPPING) {
-      engine.onRoundObserved(value);
-      log(engine.state.message);
+    if (bot.awaitingBet && !bot.pending && !bot.verifying) {
+      handleMissedRound(value, id);
       return;
     }
-    if (bot.awaitingBet && !bot.pending) {
-      log(`Missed this round at ${id || "?"} ${round2(value)}x — not betting the following one`);
-      bot.awaitingBet = false;
-      bot.armedAtId = 0;
-      stopPlacePump();
-      engine.setWatchingStreak(0);
-      engine.onRoundObserved(value);
-      log(engine.state.message);
-      if (engine.shouldBet()) armBet(id || bot.lastGameId);
+    if (isEnabled("streak_low") && streakEngine.state.mode === Mode.SKIPPING) {
+      streakEngine.onRoundObserved(value);
+      log(streakEngine.state.message, "streak_low");
+      if (isEnabled("single_green")) {
+        sgEngine.onRoundObserved(value, id);
+        log(sgEngine.state.message, "single_green");
+      }
+      const intent = pickBetIntent();
+      if (intent) {
+        bot.armedStrategy = intent.key;
+        armBet(id || bot.lastGameId, intent.key);
+      }
       return;
     }
-    engine.onRoundObserved(value);
-    log(engine.state.message);
-    if (engine.shouldBet()) armBet(id || bot.lastGameId);
+    if (isEnabled("streak_low")) {
+      streakEngine.onRoundObserved(value);
+      log(streakEngine.state.message, "streak_low");
+    }
+    if (isEnabled("single_green")) {
+      sgEngine.onRoundObserved(value, id);
+      log(sgEngine.state.message, "single_green");
+    }
+    const intent = pickBetIntent();
+    if (intent) {
+      bot.armedStrategy = intent.key;
+      armBet(id || bot.lastGameId, intent.key);
+    }
   }
 
   function watchBanner() {
@@ -782,6 +988,18 @@
     });
   }
 
+  function onKeepaliveTick() {
+    sendGameValueUpdates();
+    if (bot.pending) settle();
+    if (bot.betting && (bot.awaitingBet || bot.verifying)) tryPlace();
+    else if (canPlace()) tryPlace();
+    renderOverlay();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && bot.betting) onKeepaliveTick();
+  });
+
   function tick() {
     if (!extAlive()) {
       die();
@@ -792,12 +1010,15 @@
     try {
       syncStartFromWallet(readBalance());
       const live = readLiveMult();
-      if (live != null) engine.state.last_multiplier_seen = live;
+      if (live != null) {
+        streakEngine.state.last_multiplier_seen = live;
+        sgEngine.state.last_multiplier_seen = live;
+      }
 
       const cd = readCountdown();
       const phase = detectPhase(cd, live);
       if (phase !== bot.lastPhase) {
-        log(`phase ${bot.lastPhase} -> ${phase} live=${live ?? "—"} cd=${cd ?? "—"}`);
+        log(`phase ${bot.lastPhase} -> ${phase} live=${live ?? "—"} cd=${cd ?? "—"}`, "system");
       }
 
       if (bot.pending) settle();
@@ -818,15 +1039,61 @@
   }
 
   function status() {
-    const snap = engine.snapshot();
-    snap.betting_enabled = bot.betting;
-    snap.pending_stake = bot.pending ? bot.pending.stake : null;
-    snap.site_message = bot.siteMessage;
-    snap.live_multiplier = engine.state.last_multiplier_seen;
-    snap.logs = bot.logs.slice(-80);
-    snap.bet_log = bot.betLog.slice(-100);
-    snap.config = { ...engine.config };
-    return snap;
+    const sl = streakEngine.snapshot();
+    const sg = sgEngine.snapshot();
+    const combined = combinedPnl();
+    let startBal = 0;
+    if (isEnabled("streak_low")) startBal += Number(sl.start_balance) || 0;
+    if (isEnabled("single_green")) startBal += Number(sg.start_balance) || 0;
+    return {
+      betting_enabled: bot.betting,
+      enabled_streak_low: isEnabled("streak_low"),
+      enabled_single_green: isEnabled("single_green"),
+      armed_strategy: bot.armedStrategy,
+      pending_stake: bot.pending ? bot.pending.stake : null,
+      pending_strategy: bot.pending ? bot.pending.strategy : null,
+      site_message: strategyStatusLines()
+        .map((l) => `[${l.tag}] ${l.text}`)
+        .join(" · ") || bot.siteMessage,
+      live_multiplier: streakEngine.state.last_multiplier_seen,
+      session_pnl: round8(combined),
+      current_balance: round8(startBal + combined),
+      streak_low: sl,
+      single_green: sg,
+      logs: {
+        streak_low: bot.logs.streak_low.slice(-40),
+        single_green: bot.logs.single_green.slice(-40),
+        system: bot.logs.system.slice(-20),
+      },
+      bet_log_streak_low: bot.betLog.streak_low.slice(-100),
+      bet_log_single_green: bot.betLog.single_green.slice(-100),
+      config: { ...botConfig },
+    };
+  }
+
+  function escapeHtml(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function strategyStatusLines() {
+    const lines = [];
+    if (isEnabled("streak_low")) lines.push({ tag: "4-Low", text: streakEngine.state.message });
+    if (isEnabled("single_green")) lines.push({ tag: "SG", text: sgEngine.state.message });
+    return lines;
+  }
+
+  function overlayFooterHtml() {
+    const lines = strategyStatusLines();
+    if (!lines.length) return `<div class="msg">${escapeHtml(bot.siteMessage)}</div>`;
+    return lines
+      .map(
+        (l) =>
+          `<div class="msg"><span class="msg-tag">${escapeHtml(l.tag)}</span> ${escapeHtml(l.text)}</div>`
+      )
+      .join("");
   }
 
   function renderOverlay() {
@@ -836,20 +1103,21 @@
       el.id = "bc-crash-4low-overlay";
       document.documentElement.appendChild(el);
     }
-    const s = engine.snapshot();
-    const live = engine.state.last_multiplier_seen;
+    const sl = streakEngine.snapshot();
+    const sg = sgEngine.snapshot();
+    const live = streakEngine.state.last_multiplier_seen;
+    const recentLows = (sl.recent_crashes || []).slice(-4).map((v) => Number(v).toFixed(2)).join(" ");
     el.innerHTML = `
-      <div class="title">BC 4-Low Bot v${extVersion}</div>
+      <div class="title">BC Crash Bot v${extVersion}</div>
       <div class="row"><span class="k">Betting</span><span class="v ${bot.betting ? "on" : "off"}">${bot.betting ? "ON" : "off"}</span></div>
-      <div class="row"><span class="k">Mode</span><span class="v">${s.mode}</span></div>
-      <div class="row"><span class="k">Streak</span><span class="v">${s.low_streak}/${s.streak_needed}${bot.awaitingBet ? " NOW" : ""}</span></div>
-      <div class="row"><span class="k">Lows</span><span class="v">${(s.recent_crashes || []).slice(-4).map((v) => Number(v).toFixed(2)).join(" ") || "—"}</span></div>
-      <div class="row"><span class="k">Skip</span><span class="v">${s.skip_remaining || 0}</span></div>
-      <div class="row"><span class="k">Stake</span><span class="v">${bot.pending ? bot.pending.stake : s.current_stake}</span></div>
+      <div class="row"><span class="k">Armed</span><span class="v">${bot.armedStrategy || "—"}${bot.awaitingBet ? " NOW" : ""}</span></div>
+      <div class="row"><span class="k">4-Low</span><span class="v">${isEnabled("streak_low") ? `${sl.low_streak}/${sl.streak_needed}` : "off"}</span></div>
+      <div class="row"><span class="k">SG</span><span class="v">${isEnabled("single_green") ? `${sg.sg_count}/${sg.sg_needed}${sg.armed ? " armed" : ""}` : "off"}</span></div>
+      ${isEnabled("streak_low") && recentLows ? `<div class="row lows"><span class="k">Recent</span><span class="v">${recentLows}</span></div>` : ""}
+      <div class="row"><span class="k">Stake</span><span class="v">${bot.pending ? bot.pending.stake : "—"}</span></div>
       <div class="row"><span class="k">Live</span><span class="v">${live != null ? live.toFixed(2) + "x" : "—"}</span></div>
-      <div class="row"><span class="k">W / L</span><span class="v">${s.wins} / ${s.losses}</span></div>
-      <div class="row"><span class="k">P/L</span><span class="v">${s.session_pnl}</span></div>
-      <div class="msg">${bot.siteMessage}</div>
+      <div class="row"><span class="k">P/L</span><span class="v">${combinedPnl()}</span></div>
+      ${overlayFooterHtml()}
     `;
   }
 
@@ -863,14 +1131,33 @@
         sendResponse(status());
         return;
       }
+      if (msg.type === "KEEPALIVE_TICK") {
+        onKeepaliveTick();
+        sendResponse({ ok: true });
+        return;
+      }
       if (msg.type === "START_BET") {
+        if (!isEnabled("streak_low") && !isEnabled("single_green")) {
+          log("Enable at least one strategy in the popup", "system");
+          sendResponse(status());
+          return;
+        }
         bot.betting = true;
         bot.placeAfter = 0;
         bot.pending = null;
+        bot.armedStrategy = null;
+        syncBettingFlag();
         applyBannerTailStreak();
         const bal = readBalance();
-        if (bal != null && (engine.config.start_balance === 0 || engine.state.bets_placed === 0)) {
-          engine.setStartBalance(bal);
+        if (bal != null) {
+          const n = activeStrategies().length || 1;
+          const each = bal / n;
+          if (isEnabled("streak_low") && (streakEngine.config.start_balance === 0 || streakEngine.state.bets_placed === 0)) {
+            streakEngine.setStartBalance(each);
+          }
+          if (isEnabled("single_green") && (sgEngine.config.start_balance === 0 || sgEngine.state.bets_placed === 0)) {
+            sgEngine.setStartBalance(each);
+          }
         }
         tryPlace();
         sendResponse(status());
@@ -879,41 +1166,62 @@
       if (msg.type === "STOP_BET") {
         bot.betting = false;
         bot.awaitingBet = false;
+        bot.armedStrategy = null;
+        syncAwaitingFlag();
+        syncBettingFlag();
         stopPlacePump();
-        log("Betting OFF");
+        log("Betting OFF", "system");
         sendResponse(status());
         return;
       }
       if (msg.type === "UPDATE_CONFIG") {
-        engine.updateConfig(msg.config || {});
-        chrome.storage.local.set({ config: engine.config });
-        log("Settings saved");
+        botConfig = normalizeBotConfig({ ...botConfig, ...(msg.config || {}) });
+        streakEngine.updateConfig(botConfig.streak_low);
+        sgEngine.updateConfig(botConfig.single_green);
+        chrome.storage.local.set({ config: botConfig });
+        log("Settings saved", "system");
         sendResponse(status());
         return;
       }
       if (msg.type === "RESET") {
         bot.pending = null;
-        bot.betLog = [];
-        bot.logs = [];
+        bot.betLog = { streak_low: [], single_green: [] };
+        bot.logs = { streak_low: [], single_green: [], system: [] };
         bot.lastGameId = 0;
         bot.awaitingBet = false;
+        bot.armedStrategy = null;
         bot.armedAtId = 0;
         stopPlacePump();
-        engine.reset();
+        streakEngine.reset();
+        sgEngine.reset();
         const bal = readBalance();
-        if (bal != null) engine.setStartBalance(bal);
-        log(engine.state.message);
+        if (bal != null) {
+          const n = activeStrategies().length || 1;
+          const each = bal / n;
+          if (isEnabled("streak_low")) streakEngine.setStartBalance(each);
+          if (isEnabled("single_green")) sgEngine.setStartBalance(each);
+        }
+        log("Reset complete", "system");
         sendResponse(status());
       }
     });
 
     chrome.storage.local.get("config", (data) => {
       if (!extAlive()) return;
-      if (data && data.config) engine.updateConfig(data.config);
+      if (data && data.config) {
+        botConfig = normalizeBotConfig(data.config);
+        streakEngine.updateConfig(botConfig.streak_low);
+        sgEngine.updateConfig(botConfig.single_green);
+      }
       const bal = readBalance();
-      if (bal != null) engine.setStartBalance(bal);
+      if (bal != null) {
+        const n = activeStrategies().length || 1;
+        const each = bal / n;
+        if (isEnabled("streak_low")) streakEngine.setStartBalance(each);
+        if (isEnabled("single_green")) sgEngine.setStartBalance(each);
+      }
       renderOverlay();
-      log("Ready. Wait for 4 lows < 1.45, then bet immediately @ 1.9x.");
+      log("Ready — enable strategies in popup, then Start.", "system");
       startLiveUpdates();
     });
 

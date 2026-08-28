@@ -25,11 +25,22 @@
 #bc-crash-4low-overlay .on { color: #3dd68c; }
 #bc-crash-4low-overlay .off { color: #f31260; }
 #bc-crash-4low-overlay .msg {
-  margin-top: 6px;
+  margin-top: 4px;
   font-size: 11px;
   color: #b8c4d1;
   line-height: 1.35;
   word-break: break-word;
+}
+#bc-crash-4low-overlay .msg:first-of-type {
+  margin-top: 6px;
+}
+#bc-crash-4low-overlay .msg-tag {
+  color: #7eb6ff;
+  font-weight: 600;
+}
+#bc-crash-4low-overlay .row.lows .v {
+  font-size: 11px;
+  color: #b8c4d1;
 }
 #bc-crash-4low-overlay .title {
   font-size: 11px;

@@ -1,7 +1,7 @@
 document.getElementById("extVer").textContent =
   "v" + chrome.runtime.getManifest().version;
 
-const KEYS = [
+const STREAK_KEYS = [
   "stake",
   "cashout",
   "low_below",
@@ -9,6 +9,7 @@ const KEYS = [
   "skip_on_lose",
   "stop_loss",
 ];
+const SG_KEYS = ["stake", "cashout", "green", "single_greens_required", "stop_loss"];
 
 function isCrashUrl(url) {
   return /bc\.game|bcmail2\.com/i.test(url || "");
@@ -40,7 +41,12 @@ async function ping(tabId) {
 async function injectFiles(tabId, allFrames) {
   await chrome.scripting.executeScript({
     target: { tabId, allFrames },
-    files: ["strategy.js", "content.js"],
+    files: [
+      "strategy.js",
+      "strategy-single-green.js",
+      "config.js",
+      "content.js",
+    ],
   });
   try {
     await chrome.scripting.insertCSS({
@@ -74,7 +80,7 @@ async function send(type, extra = {}) {
     document.getElementById("msg").textContent = "Connecting to crash tab…";
     try {
       await injectBot(tab.id);
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 250));
       status = await ping(tab.id);
     } catch (err) {
       document.getElementById("msg").textContent =
@@ -84,7 +90,7 @@ async function send(type, extra = {}) {
   }
   if (!status) {
     document.getElementById("msg").textContent =
-      "Still not connected. Reload the extension on chrome://extensions, refresh the crash page, then try Start again.";
+      "Still not connected. Reload the extension, refresh the crash page, then try Start.";
     return null;
   }
   if (type === "GET_STATUS") return status;
@@ -99,13 +105,31 @@ async function send(type, extra = {}) {
 
 let formReady = false;
 
-function fillForm(cfg) {
-  if (!cfg) return;
-  const form = document.getElementById("cfg");
-  if (form.contains(document.activeElement)) return;
-  KEYS.forEach((k) => {
+function fillFormKeys(form, cfg, keys, intKeys) {
+  if (!cfg || !form) return;
+  keys.forEach((k) => {
     if (cfg[k] != null && form.elements[k]) form.elements[k].value = cfg[k];
   });
+}
+
+function readFormKeys(form, keys, intKeys) {
+  const out = {};
+  keys.forEach((k) => {
+    const v = form.elements[k].value;
+    out[k] = intKeys.includes(k) ? parseInt(v, 10) : parseFloat(v);
+  });
+  return out;
+}
+
+function fillForm(cfg) {
+  if (!cfg) return;
+  const streakForm = document.getElementById("cfgStreak");
+  const sgForm = document.getElementById("cfgSg");
+  if (streakForm.contains(document.activeElement) || sgForm.contains(document.activeElement)) return;
+  document.getElementById("enStreak").checked = cfg.enabled_streak_low !== false;
+  document.getElementById("enSg").checked = !!cfg.enabled_single_green;
+  fillFormKeys(streakForm, cfg.streak_low || {}, STREAK_KEYS, ["streak_needed", "skip_on_lose"]);
+  fillFormKeys(sgForm, cfg.single_green || {}, SG_KEYS, ["single_greens_required"]);
 }
 
 function fmtAmt(n) {
@@ -120,20 +144,19 @@ function fmtStake(n) {
   return String(v);
 }
 
-function renderLog(s) {
-  const won = document.getElementById("logWon");
-  const lost = document.getElementById("logLost");
-  const pnl = document.getElementById("logPnl");
-  won.textContent = Number(s.total_won || 0).toFixed(4);
-  lost.textContent = Number(s.total_lost || 0).toFixed(4);
-  const pl = Number(s.session_pnl || 0);
+function renderLogPanel(rows, boxId, wonId, lostId, pnlId, snap) {
+  const won = document.getElementById(wonId);
+  const lost = document.getElementById(lostId);
+  const pnl = document.getElementById(pnlId);
+  won.textContent = Number(snap.total_won || 0).toFixed(4);
+  lost.textContent = Number(snap.total_lost || 0).toFixed(4);
+  const pl = Number(snap.session_pnl || 0);
   pnl.textContent = fmtAmt(pl);
   pnl.className = pl >= 0 ? "win" : "lose";
 
-  const box = document.getElementById("logList");
-  const rows = Array.isArray(s.bet_log) ? s.bet_log : [];
+  const box = document.getElementById(boxId);
   if (!rows.length) {
-    box.innerHTML = `<div class="log-empty">No bets yet. Start on the Bot tab.</div>`;
+    box.innerHTML = `<div class="log-empty">No bets yet.</div>`;
     return;
   }
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 28;
@@ -144,9 +167,7 @@ function renderLog(s) {
       const kind = r.kind || "bet";
       const label = kind === "win" ? "WIN" : kind === "lose" ? "LOSE" : "BET";
       const amount =
-        kind === "bet"
-          ? `@ ${r.cashout ?? "—"}x`
-          : fmtAmt(r.profit);
+        kind === "bet" ? `@ ${r.cashout ?? "—"}x` : fmtAmt(r.profit);
       const crash = r.crash != null ? `${r.crash}x` : "—";
       return `<div class="log-row ${kind}">
         <span>${r.t || ""}</span>
@@ -162,69 +183,115 @@ function renderLog(s) {
 
 function render(s, { syncForm = false } = {}) {
   if (!s) return;
-  document.getElementById("mode").textContent = s.mode || "idle";
+  const sl = s.streak_low || {};
+  const sg = s.single_green || {};
+
   const betting = document.getElementById("betting");
   betting.textContent = s.betting_enabled ? "ON" : "off";
   betting.className = s.betting_enabled ? "win" : "lose";
-  document.getElementById("streak").textContent =
-    `${s.low_streak ?? 0} / ${s.streak_needed ?? 4}`;
-  document.getElementById("skip").textContent = String(s.skip_remaining ?? 0);
-  document.getElementById("stake").textContent = s.pending_stake != null
-    ? String(s.pending_stake)
-    : String(s.current_stake);
+
+  document.getElementById("armed").textContent = s.pending_strategy
+    ? `${s.pending_strategy} (live)`
+    : s.armed_strategy
+      ? `${s.armed_strategy}${s.betting_enabled ? "" : ""}`
+      : "—";
+
   const pnl = document.getElementById("pnl");
   pnl.textContent = Number(s.session_pnl || 0).toFixed(4);
-  pnl.className = s.session_pnl >= 0 ? "win" : "lose";
-  document.getElementById("wl").textContent = `${s.wins ?? 0} / ${s.losses ?? 0}`;
+  pnl.className = (s.session_pnl || 0) >= 0 ? "win" : "lose";
   document.getElementById("bal").textContent =
     s.current_balance != null ? Number(s.current_balance).toFixed(4) : "—";
-  document.getElementById("msg").textContent = s.site_message || s.message || "—";
-  renderLog(s);
-  if (syncForm && s.config) {
-    fillForm(s.config);
-    formReady = true;
-  } else if (!formReady && s.config) {
+
+  document.getElementById("streakStat").textContent =
+    `${sl.low_streak ?? 0} / ${sl.streak_needed ?? 4} lows · ${sl.mode || "idle"}`;
+  document.getElementById("streakWl").textContent = `${sl.wins ?? 0} W / ${sl.losses ?? 0} L`;
+  document.getElementById("streakPnl").textContent = `P/L ${Number(sl.session_pnl || 0).toFixed(2)}`;
+
+  document.getElementById("sgStat").textContent =
+    `${sg.sg_count ?? 0} / ${sg.sg_needed ?? 3} SG${sg.armed ? " · armed" : ""}`;
+  document.getElementById("sgWl").textContent = `${sg.wins ?? 0} W / ${sg.losses ?? 0} L`;
+  document.getElementById("sgPnl").textContent = `P/L ${Number(sg.session_pnl || 0).toFixed(2)}`;
+
+  document.getElementById("boxStreak").classList.toggle("off", s.enabled_streak_low === false);
+  document.getElementById("boxSg").classList.toggle("off", !s.enabled_single_green);
+
+  document.getElementById("msg").textContent = s.site_message || "—";
+
+  renderLogPanel(
+    Array.isArray(s.bet_log_streak_low) ? s.bet_log_streak_low : [],
+    "logListStreak",
+    "logWonStreak",
+    "logLostStreak",
+    "logPnlStreak",
+    sl
+  );
+  renderLogPanel(
+    Array.isArray(s.bet_log_single_green) ? s.bet_log_single_green : [],
+    "logListSg",
+    "logWonSg",
+    "logLostSg",
+    "logPnlSg",
+    sg
+  );
+
+  if ((syncForm || !formReady) && s.config) {
     fillForm(s.config);
     formReady = true;
   }
 }
 
+function showTab(id) {
+  document.querySelectorAll(".tab").forEach((b) => {
+    b.classList.toggle("active", b.getAttribute("data-tab") === id);
+  });
+  document.getElementById("panelBot").classList.toggle("hidden", id !== "bot");
+  document.getElementById("panelLogStreak").classList.toggle("hidden", id !== "log-streak");
+  document.getElementById("panelLogSg").classList.toggle("hidden", id !== "log-sg");
+}
+
 document.querySelectorAll(".tab").forEach((btn) => {
-  btn.onclick = () => {
-    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-    const id = btn.getAttribute("data-tab");
-    document.getElementById("panelBot").classList.toggle("hidden", id !== "bot");
-    document.getElementById("panelLog").classList.toggle("hidden", id !== "log");
-  };
+  btn.onclick = () => showTab(btn.getAttribute("data-tab"));
 });
 
+function buildConfigFromForms() {
+  const streakForm = document.getElementById("cfgStreak");
+  const sgForm = document.getElementById("cfgSg");
+  return {
+    enabled_streak_low: document.getElementById("enStreak").checked,
+    enabled_single_green: document.getElementById("enSg").checked,
+    streak_low: readFormKeys(streakForm, STREAK_KEYS, ["streak_needed", "skip_on_lose"]),
+    single_green: readFormKeys(sgForm, SG_KEYS, ["single_greens_required"]),
+  };
+}
+
 document.getElementById("btnStart").onclick = async () => {
+  const cfg = buildConfigFromForms();
+  if (!cfg.enabled_streak_low && !cfg.enabled_single_green) {
+    document.getElementById("msg").textContent = "Enable at least one strategy.";
+    return;
+  }
   document.getElementById("msg").textContent = "Starting…";
+  await send("UPDATE_CONFIG", { config: cfg });
   render(await send("START_BET"));
 };
+
 document.getElementById("btnStop").onclick = async () => {
   render(await send("STOP_BET"));
 };
+
 document.getElementById("btnReset").onclick = async () => {
   render(await send("RESET"));
 };
-document.getElementById("cfg").onsubmit = async (e) => {
-  e.preventDefault();
-  const form = e.target;
-  const config = {};
-  KEYS.forEach((k) => {
-    const v = form.elements[k].value;
-    config[k] = k === "streak_needed" || k === "skip_on_lose"
-      ? parseInt(v, 10)
-      : parseFloat(v);
-  });
+
+document.getElementById("btnSave").onclick = async () => {
+  const config = buildConfigFromForms();
   render(await send("UPDATE_CONFIG", { config }), { syncForm: true });
 };
 
 async function refresh() {
   render(await send("GET_STATUS"));
 }
+
 refresh().then(() => {
   chrome.storage.local.get("config", (data) => {
     if (data.config) fillForm(data.config);

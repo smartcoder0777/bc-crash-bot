@@ -2,29 +2,50 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>BC Crash 4-Low</title>
+  <title>BC Crash Bot</title>
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
-  <h1>BC 4-Low <span id="extVer" class="ver"></span></h1>
-  <p id="pageHint" class="hint">Wait for 4 lows &lt; 1.45, then bet immediately @ 1.9x. Do not run the other BC bot at the same time.</p>
+  <h1>BC Crash Bot <span id="extVer" class="ver"></span></h1>
+  <p id="pageHint" class="hint">Enable one or both strategies. Only one bets per round. Do not run the other BC bot on the same tab.</p>
 
   <div class="tabs" role="tablist">
     <button type="button" class="tab active" data-tab="bot" id="tabBot">Bot</button>
-    <button type="button" class="tab" data-tab="log" id="tabLog">Log</button>
+    <button type="button" class="tab" data-tab="log-streak" id="tabLogStreak">4-Low log</button>
+    <button type="button" class="tab" data-tab="log-sg" id="tabLogSg">SG log</button>
   </div>
 
   <section id="panelBot" class="tab-panel">
+    <div class="enable-row">
+      <label class="chk"><input type="checkbox" id="enStreak" checked /> Streak-low</label>
+      <label class="chk"><input type="checkbox" id="enSg" /> Single-green</label>
+    </div>
+
     <div class="stats">
-      <div><span>Mode</span><b id="mode">idle</b></div>
       <div><span>Betting</span><b id="betting">off</b></div>
-      <div><span>Streak</span><b id="streak">0 / 4</b></div>
-      <div><span>Skip</span><b id="skip">0</b></div>
-      <div><span>Stake</span><b id="stake">—</b></div>
-      <div><span>P/L</span><b id="pnl">0</b></div>
-      <div><span>W / L</span><b id="wl">0 / 0</b></div>
+      <div><span>Armed</span><b id="armed">—</b></div>
+      <div><span>Combined P/L</span><b id="pnl">0</b></div>
       <div><span>Balance</span><b id="bal">—</b></div>
     </div>
+
+    <div class="strat-box" id="boxStreak">
+      <div class="strat-title">Streak-low</div>
+      <div class="mini-stats">
+        <span id="streakStat">0 / 4 lows</span>
+        <span id="streakWl">0 W / 0 L</span>
+        <span id="streakPnl">P/L 0</span>
+      </div>
+    </div>
+
+    <div class="strat-box" id="boxSg">
+      <div class="strat-title">Single-green</div>
+      <div class="mini-stats">
+        <span id="sgStat">0 / 3 SG</span>
+        <span id="sgWl">0 W / 0 L</span>
+        <span id="sgPnl">P/L 0</span>
+      </div>
+    </div>
+
     <p id="msg" class="msg">—</p>
 
     <div class="actions">
@@ -33,22 +54,33 @@
       <button type="button" id="btnReset">Reset</button>
     </div>
 
-    <form id="cfg">
+    <form id="cfgStreak" class="cfg-form">
+      <div class="form-title">Streak-low settings</div>
       <label>Bet amount <input name="stake" type="number" step="any" /></label>
       <label>Cash out <input name="cashout" type="number" step="any" /></label>
       <label>Low below <input name="low_below" type="number" step="any" /></label>
       <label>Lows in a row <input name="streak_needed" type="number" step="1" /></label>
       <label>Skip after lose <input name="skip_on_lose" type="number" step="1" /></label>
       <label>Stop loss <input name="stop_loss" type="number" step="any" /></label>
-      <button type="submit" class="on">Save settings</button>
     </form>
+
+    <form id="cfgSg" class="cfg-form">
+      <div class="form-title">Single-green settings</div>
+      <label>Bet amount <input name="stake" type="number" step="any" /></label>
+      <label>Cash out <input name="cashout" type="number" step="any" /></label>
+      <label>Green ≥ <input name="green" type="number" step="any" /></label>
+      <label>Single greens <input name="single_greens_required" type="number" step="1" min="1" max="10" /></label>
+      <label>Stop loss <input name="stop_loss" type="number" step="any" /></label>
+    </form>
+
+    <button type="button" id="btnSave" class="on save-all">Save settings</button>
   </section>
 
-  <section id="panelLog" class="tab-panel hidden">
+  <section id="panelLogStreak" class="tab-panel hidden">
     <div class="log-totals">
-      <div><span>Won</span><b id="logWon" class="win">0</b></div>
-      <div><span>Lost</span><b id="logLost" class="lose">0</b></div>
-      <div><span>P/L</span><b id="logPnl">0</b></div>
+      <div><span>Won</span><b id="logWonStreak" class="win">0</b></div>
+      <div><span>Lost</span><b id="logLostStreak" class="lose">0</b></div>
+      <div><span>P/L</span><b id="logPnlStreak">0</b></div>
     </div>
     <div class="log-head">
       <span>Time</span>
@@ -57,12 +89,30 @@
       <span>Amount</span>
       <span>Crash</span>
     </div>
-    <div id="logList" class="log-list">
-      <div class="log-empty">No bets yet. Start on the Bot tab.</div>
+    <div id="logListStreak" class="log-list">
+      <div class="log-empty">No streak-low bets yet.</div>
     </div>
   </section>
 
-  <p class="hint">Load the extension-4low folder as an unpacked extension. Keep the crash tab visible.</p>
+  <section id="panelLogSg" class="tab-panel hidden">
+    <div class="log-totals">
+      <div><span>Won</span><b id="logWonSg" class="win">0</b></div>
+      <div><span>Lost</span><b id="logLostSg" class="lose">0</b></div>
+      <div><span>P/L</span><b id="logPnlSg">0</b></div>
+    </div>
+    <div class="log-head">
+      <span>Time</span>
+      <span>Type</span>
+      <span>Bet</span>
+      <span>Amount</span>
+      <span>Crash</span>
+    </div>
+    <div id="logListSg" class="log-list">
+      <div class="log-empty">No single-green bets yet.</div>
+    </div>
+  </section>
+
+  <p class="hint">Reload extension after update. Keep crash tab open when betting.</p>
   <script src="popup.js"></script>
 </body>
 </html>
