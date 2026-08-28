@@ -168,13 +168,16 @@ function renderLogPanel(rows, boxId, wonId, lostId, pnlId, snap) {
       const label = kind === "win" ? "WIN" : kind === "lose" ? "LOSE" : "BET";
       const amount =
         kind === "bet" ? `@ ${r.cashout ?? "—"}x` : fmtAmt(r.profit);
-      const crash = r.crash != null ? `${r.crash}x` : "—";
+      let round = "—";
+      if (r.crash != null && r.crashId != null) round = `${r.crash}x #${r.crashId}`;
+      else if (r.crash != null) round = `${r.crash}x`;
+      else if (r.gameId != null) round = `#${r.gameId}`;
       return `<div class="log-row ${kind}">
         <span>${r.t || ""}</span>
         <span class="kind">${label}</span>
         <span>${fmtStake(r.stake)}</span>
         <span class="${kind === "win" ? "win" : kind === "lose" ? "lose" : ""}">${amount}</span>
-        <span>${crash}</span>
+        <span>${round}</span>
       </div>`;
     })
     .join("");

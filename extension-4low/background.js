@@ -1,6 +1,7 @@
 const KEEPALIVE_ALARM = "bc4low-keepalive";
 const TICK_MS = 4000;
-const TICK_ARMED_MS = 2500;
+const TICK_ARMED_MS = 500;
+const TICK_PENDING_MS = 350;
 
 function scheduleKeepalive(ms) {
   chrome.alarms.clear(KEEPALIVE_ALARM, () => {
@@ -53,6 +54,7 @@ chrome.runtime.onInstalled.addListener(() => {
         },
         betting_enabled: false,
         awaiting_bet: false,
+        pending_bet: false,
       });
     }
   });
@@ -60,12 +62,12 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== KEEPALIVE_ALARM) return;
-  const data = await chrome.storage.local.get(["betting_enabled", "awaiting_bet"]);
+  const data = await chrome.storage.local.get(["betting_enabled", "awaiting_bet", "pending_bet"]);
   if (!data.betting_enabled) {
     stopKeepalive();
     return;
   }
-  const ms = data.awaiting_bet ? TICK_ARMED_MS : TICK_MS;
+  const ms = data.pending_bet ? TICK_PENDING_MS : data.awaiting_bet ? TICK_ARMED_MS : TICK_MS;
   scheduleKeepalive(ms);
   await pingCrashTabs();
 });
@@ -80,14 +82,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg.type === "BETTING_OFF") {
-    chrome.storage.local.set({ betting_enabled: false, awaiting_bet: false }, () => {
+    chrome.storage.local.set({ betting_enabled: false, awaiting_bet: false, pending_bet: false }, () => {
       stopKeepalive();
       sendResponse({ ok: true });
     });
     return true;
   }
   if (msg.type === "AWAITING_BET") {
-    chrome.storage.local.set({ awaiting_bet: !!msg.value });
+    chrome.storage.local.set({ awaiting_bet: !!msg.value }, () => {
+      if (msg.value) scheduleKeepalive(TICK_ARMED_MS);
+    });
+    return;
+  }
+  if (msg.type === "PENDING_BET") {
+    chrome.storage.local.set({ pending_bet: !!msg.value }, () => {
+      if (msg.value) scheduleKeepalive(TICK_PENDING_MS);
+    });
     return;
   }
 });

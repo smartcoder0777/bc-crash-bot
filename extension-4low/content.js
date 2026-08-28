@@ -124,6 +124,29 @@
     renderOverlay();
   }
 
+  const BET_LOG_STORAGE = "bc_bot_bet_log_v1";
+
+  function persistBetLogs() {
+    try {
+      chrome.storage.local.set({ [BET_LOG_STORAGE]: bot.betLog });
+    } catch (_) {}
+  }
+
+  function loadBetLogs(done) {
+    try {
+      chrome.storage.local.get(BET_LOG_STORAGE, (data) => {
+        const raw = data && data[BET_LOG_STORAGE];
+        if (raw && typeof raw === "object") {
+          if (Array.isArray(raw.streak_low)) bot.betLog.streak_low = raw.streak_low.slice(-150);
+          if (Array.isArray(raw.single_green)) bot.betLog.single_green = raw.single_green.slice(-150);
+        }
+        if (done) done();
+      });
+    } catch (_) {
+      if (done) done();
+    }
+  }
+
   function pushBetLog(entry, strategy) {
     const key = strategy === "single_green" ? "single_green" : "streak_low";
     bot.betLog[key].push({
@@ -131,6 +154,44 @@
       ...entry,
     });
     if (bot.betLog[key].length > 150) bot.betLog[key].shift();
+    persistBetLogs();
+  }
+
+  function popLastBetLog(strategy) {
+    const key = strategy === "single_green" ? "single_green" : "streak_low";
+    const rows = bot.betLog[key];
+    if (!rows.length || rows[rows.length - 1].kind !== "bet") return false;
+    rows.pop();
+    persistBetLogs();
+    return true;
+  }
+
+  function dropPendingBet(reason) {
+    const p = bot.pending;
+    if (!p) return;
+    const strat = p.strategy || "streak_low";
+    popLastBetLog(strat);
+    bot.pending = null;
+    bot.awaitingBet = false;
+    bot.armedStrategy = null;
+    bot.armedAtId = 0;
+    stopPlacePump();
+    syncPendingFlag();
+    log(`Bet removed from log (${reason})`, strat);
+  }
+
+  function checkPendingCancelled() {
+    const p = bot.pending;
+    if (!p || !p.verified || p.sawRound) return;
+    if (document.hidden) return;
+    const age = (Date.now() - p.placedAt) / 1000;
+    if (age < 1.5) return;
+    const cd = readCountdown();
+    const live = readLiveMult();
+    const phase = detectPhase(cd, live);
+    if (phase !== "betting") return;
+    if (isMainPlacedBet()) return;
+    if (findMainBetButton()) dropPendingBet("cancelled on site before round");
   }
 
   function inHeader(el) {
@@ -142,15 +203,31 @@
     return r.width > 16 && r.height > 10 && r.bottom > 0 && r.top < window.innerHeight;
   }
 
+  /** Tab hidden / screen locked: getBoundingClientRect is often 0×0 — still allow DOM clicks. */
+  function interactive(el) {
+    if (!el || el.disabled || el.getAttribute("aria-disabled") === "true") return false;
+    if (!el.isConnected) return false;
+    if (inHeader(el)) return false;
+    if (!document.hidden && document.visibilityState === "visible") return visible(el);
+    try {
+      const s = window.getComputedStyle(el);
+      if (s.display === "none" || s.visibility === "hidden" || s.pointerEvents === "none") return false;
+    } catch (_) {}
+    return true;
+  }
+
   function isSideBetLabel(text) {
     return /^side\s*bet(\s*\(.*\))?$/i.test(String(text || "").replace(/\s+/g, " ").trim());
   }
 
   function findSideBetButton() {
-    return allBetControls().find((b) => visible(b) && isSideBetLabel(normText(b))) || null;
+    return allBetControls().find((b) => interactive(b) && isSideBetLabel(normText(b))) || null;
   }
 
   function sideBetLeft() {
+    if (document.hidden || document.visibilityState !== "visible") {
+      return window.innerWidth * 0.55;
+    }
     const side = findSideBetButton();
     if (side) return side.getBoundingClientRect().left - 12;
     const main = findMainBetButton();
@@ -163,7 +240,7 @@
   }
 
   function isFillableInput(el) {
-    if (!el || el.disabled || inHeader(el) || !visible(el)) return false;
+    if (!el || el.disabled || inHeader(el) || !interactive(el)) return false;
     if (inSideBet(el)) return false;
     const mode = (el.getAttribute("inputmode") || "").toLowerCase();
     const typ = (el.type || "text").toLowerCase();
@@ -192,7 +269,7 @@
 
   function findMainBetButton() {
     const ranked = allBetControls()
-      .filter((b) => !b.disabled && b.getAttribute("aria-disabled") !== "true" && visible(b))
+      .filter((b) => !b.disabled && b.getAttribute("aria-disabled") !== "true" && interactive(b))
       .filter((b) => {
         const tag = (b.tagName || "").toLowerCase();
         return tag === "button" || b.getAttribute("role") === "button";
@@ -216,6 +293,14 @@
     } catch (_) {}
   }
 
+  function syncPendingFlag() {
+    try {
+      const on = !!(bot.pending && bot.pending.verified && !bot.pending.sawRound);
+      chrome.storage.local.set({ pending_bet: on });
+      if (on) chrome.runtime.sendMessage({ type: "PENDING_BET", value: true });
+    } catch (_) {}
+  }
+
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -223,7 +308,7 @@
   function isMainPlacedBet() {
     const limit = sideBetLeft();
     for (const b of allBetControls()) {
-      if (!visible(b)) continue;
+      if (!interactive(b)) continue;
       const r = b.getBoundingClientRect();
       if (r.left >= limit) continue;
       const t = normText(b).toLowerCase();
@@ -235,24 +320,28 @@
 
   async function waitForBetVerified(stake, balBefore, timeoutMs) {
     const want = round8(stake);
-    const deadline = Date.now() + (timeoutMs || 3500);
+    const hidden = document.hidden || document.visibilityState !== "visible";
+    const deadline = Date.now() + (timeoutMs || (hidden ? 9000 : 3500));
+    let uiHits = 0;
     while (Date.now() < deadline) {
-      if (isMainPlacedBet()) return { ok: true };
-      if (!findMainBetButton() && isMainPlacedBet()) return { ok: true };
-      if (balBefore != null) {
+      if (isMainPlacedBet()) uiHits += 1;
+      if (balBefore != null && !hidden) {
         const bal = readBalance();
-        if (bal != null && bal < balBefore - want * 0.85 + 1e-6) {
-          return { ok: true, balance: bal };
+        if (bal != null && bal <= balBefore - want * 0.95 + 1e-6) {
+          if (uiHits > 0 || isMainPlacedBet()) return { ok: true, balance: bal, via: "balance" };
         }
+      } else if (uiHits >= (hidden ? 3 : 2)) {
+        return { ok: true, via: "ui" };
       }
-      await sleep(120);
+      await sleep(hidden ? 200 : 120);
     }
+    if (uiHits >= 2) return { ok: true, via: "ui-late" };
     return { ok: false, why: "verify-timeout" };
   }
 
   function dismissCookies() {
-    const btn = allBetControls().find((b) => /^accept$/i.test(normText(b)));
-    if (btn && visible(btn)) btn.click();
+    const btn = allBetControls().find((b) => /^accept$/i.test(normText(b)) && interactive(b));
+    if (btn) btn.click();
   }
 
   function round8(n) {
@@ -462,9 +551,16 @@
         settle();
         return;
       }
-      log(`Banner gap ${expected} → ${id} ${value}x — pending counted as lose`, p.strategy || "streak_low");
+      if (!p.verified) {
+        dropPendingBet(`banner gap ${expected}→${id} before verify`);
+        observeRound(value, id);
+        return;
+      }
+      log(`Banner gap ${expected} → ${id} ${value}x — settle #${expected}`, p.strategy || "streak_low");
+      const games = collectBannerGames();
+      const expRow = games.find((g) => g.id === expected);
       p.gameId = expected;
-      p.gameCrash = 1;
+      p.gameCrash = expRow ? expRow.v : 1;
       p.sawRound = true;
       bot.awaitingBet = false;
       settle();
@@ -655,7 +751,7 @@
   }
   function clickManualTab() {
     const tabs = [...document.querySelectorAll('[role="tab"], button, a')];
-    const manual = tabs.find((el) => /^manual$/i.test(normText(el)) && visible(el));
+    const manual = tabs.find((el) => /^manual$/i.test(normText(el)) && interactive(el));
     if (!manual) return;
     const sel = (manual.getAttribute("aria-selected") || "") + " " + (manual.className || "");
     if (/true|active|selected/i.test(sel)) return;
@@ -750,13 +846,14 @@
 
   function startPlacePump() {
     if (bot.placePump) return;
+    const ms = document.hidden ? 400 : 50;
     bot.placePump = setInterval(() => {
       if (!extAlive() || !bot.betting || !bot.awaitingBet || bot.pending || bot.verifying) {
         if (!bot.awaitingBet || bot.pending || bot.verifying || !bot.betting) stopPlacePump();
         return;
       }
       tryPlace();
-    }, 50);
+    }, ms);
   }
 
   function stopPlacePump() {
@@ -796,6 +893,7 @@
     const lockId = bot.armedAtId || bot.lastGameId;
     if (!lockId) return;
     bot.placing = true;
+    const betGameId = lockId + 1;
     bot.pending = {
       strategy: strat,
       stake: nxt.stake,
@@ -803,6 +901,8 @@
       placedAt: Date.now(),
       maxId: lockId,
       maxGameId: lockId,
+      betGameId,
+      verified: false,
       roundSeq: bot.roundSeq,
       balAtPlace: bal,
       sawRound: false,
@@ -821,7 +921,7 @@
       return;
     }
     bot.verifying = true;
-    const verified = await waitForBetVerified(nxt.stake, bal, document.hidden ? 5000 : 3500);
+    const verified = await waitForBetVerified(nxt.stake, bal, document.hidden ? 9000 : 3500);
     bot.verifying = false;
     bot.placing = false;
     if (!verified.ok) {
@@ -838,13 +938,20 @@
         log(`Stake snapped to ${actual} (wanted ${nxt.stake})`, strat);
       }
       bot.pending.stake = actual;
+      bot.pending.verified = true;
     }
     bot.didPlaceInWindow = true;
     bot.awaitingBet = false;
     syncAwaitingFlag();
+    syncPendingFlag();
     stopPlacePump();
-    log(`Bet ${actual} @ ${nxt.cashout}x confirmed (${placed.label || "main bet"})`, strat);
-    pushBetLog({ kind: "bet", stake: actual, cashout: nxt.cashout }, strat);
+    log(`Bet ${actual} @ ${nxt.cashout}x confirmed (#${betGameId})`, strat);
+    pushBetLog({
+      kind: "bet",
+      stake: actual,
+      cashout: nxt.cashout,
+      gameId: betGameId,
+    }, strat);
   }
 
   function pendingMinId(p) {
@@ -854,6 +961,10 @@
   function settle() {
     const p = bot.pending;
     if (!p) return;
+    if (!p.verified) {
+      dropPendingBet("settle without site verify");
+      return;
+    }
     const age = (Date.now() - p.placedAt) / 1000;
     const cash2 = round2(p.cashout);
 
@@ -891,6 +1002,7 @@
     bot.armedStrategy = null;
     bot.armedAtId = 0;
     stopPlacePump();
+    syncPendingFlag();
     bot.didPlaceInWindow = false;
     bot.lastSettleAt = Date.now();
     bot.settledGameId = crashId || (bot.lastGameItem && bot.lastGameItem.id) || 0;
@@ -990,8 +1102,11 @@
 
   function onKeepaliveTick() {
     sendGameValueUpdates();
-    if (bot.pending) settle();
-    if (bot.betting && (bot.awaitingBet || bot.verifying)) tryPlace();
+    if (bot.pending) {
+      if (!document.hidden) checkPendingCancelled();
+      if (bot.pending) settle();
+    }
+    if (bot.betting && (bot.awaitingBet || bot.verifying || bot.pending)) tryPlace();
     else if (canPlace()) tryPlace();
     renderOverlay();
   }
@@ -1021,7 +1136,10 @@
         log(`phase ${bot.lastPhase} -> ${phase} live=${live ?? "—"} cd=${cd ?? "—"}`, "system");
       }
 
-      if (bot.pending) settle();
+      if (bot.pending) {
+        if (!document.hidden) checkPendingCancelled();
+        if (bot.pending) settle();
+      }
       watchBanner();
       if (canPlace()) tryPlace();
 
@@ -1186,6 +1304,7 @@
       if (msg.type === "RESET") {
         bot.pending = null;
         bot.betLog = { streak_low: [], single_green: [] };
+        persistBetLogs();
         bot.logs = { streak_low: [], single_green: [], system: [] };
         bot.lastGameId = 0;
         bot.awaitingBet = false;
@@ -1206,23 +1325,25 @@
       }
     });
 
-    chrome.storage.local.get("config", (data) => {
-      if (!extAlive()) return;
-      if (data && data.config) {
-        botConfig = normalizeBotConfig(data.config);
-        streakEngine.updateConfig(botConfig.streak_low);
-        sgEngine.updateConfig(botConfig.single_green);
-      }
-      const bal = readBalance();
-      if (bal != null) {
-        const n = activeStrategies().length || 1;
-        const each = bal / n;
-        if (isEnabled("streak_low")) streakEngine.setStartBalance(each);
-        if (isEnabled("single_green")) sgEngine.setStartBalance(each);
-      }
-      renderOverlay();
-      log("Ready — enable strategies in popup, then Start.", "system");
-      startLiveUpdates();
+    loadBetLogs(() => {
+      chrome.storage.local.get("config", (data) => {
+        if (!extAlive()) return;
+        if (data && data.config) {
+          botConfig = normalizeBotConfig(data.config);
+          streakEngine.updateConfig(botConfig.streak_low);
+          sgEngine.updateConfig(botConfig.single_green);
+        }
+        const bal = readBalance();
+        if (bal != null) {
+          const n = activeStrategies().length || 1;
+          const each = bal / n;
+          if (isEnabled("streak_low")) streakEngine.setStartBalance(each);
+          if (isEnabled("single_green")) sgEngine.setStartBalance(each);
+        }
+        renderOverlay();
+        log("Ready — enable strategies in popup, then Start.", "system");
+        startLiveUpdates();
+      });
     });
 
     tickTimer = setInterval(tick, 120);
