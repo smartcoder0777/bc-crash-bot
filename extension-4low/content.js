@@ -295,7 +295,11 @@
 
   function syncPendingFlag() {
     try {
-      const on = !!(bot.pending && bot.pending.verified && !bot.pending.sawRound);
+      const on = !!(
+        bot.pending &&
+        !bot.pending.sawRound &&
+        (bot.pending.verified || bot.pending.clicked)
+      );
       chrome.storage.local.set({ pending_bet: on });
       if (on) chrome.runtime.sendMessage({ type: "PENDING_BET", value: true });
     } catch (_) {}
@@ -306,7 +310,7 @@
   }
 
   function isMainPlacedBet() {
-    const limit = sideBetLeft();
+    const limit = document.hidden || document.visibilityState !== "visible" ? Infinity : sideBetLeft();
     for (const b of allBetControls()) {
       if (!interactive(b)) continue;
       const r = b.getBoundingClientRect();
@@ -318,24 +322,77 @@
     return false;
   }
 
-  async function waitForBetVerified(stake, balBefore, timeoutMs) {
+  function balanceDropped(balBefore, stake) {
+    if (balBefore == null) return false;
+    const bal = readBalance();
     const want = round8(stake);
+    return bal != null && bal <= balBefore - want * 0.95 + 1e-6;
+  }
+
+  function logConfirmedBet(p) {
+    if (!p || p.loggedBet) return;
+    const strat = p.strategy || "streak_low";
+    pushBetLog(
+      {
+        kind: "bet",
+        stake: p.stake,
+        cashout: p.cashout,
+        gameId: p.betGameId,
+      },
+      strat
+    );
+    p.loggedBet = true;
+    log(`Bet ${p.stake} @ ${p.cashout}x confirmed (#${p.betGameId})`, strat);
+    bot.awaitingBet = false;
+    syncAwaitingFlag();
+    syncPendingFlag();
+    stopPlacePump();
+  }
+
+  async function confirmPendingBet(p, opts) {
+    if (!p || p.verified) return true;
+    const waitMs = (opts && opts.waitMs) || 2000;
+    const hidden = document.hidden || document.visibilityState !== "visible";
+    const clickTrustMs = hidden ? 1200 : 2800;
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      if (isMainPlacedBet() || balanceDropped(p.balAtPlace, p.stake)) {
+        p.verified = true;
+        logConfirmedBet(p);
+        return true;
+      }
+      if (p.clicked && Date.now() - p.placedAt >= clickTrustMs) {
+        p.verified = true;
+        logConfirmedBet(p);
+        return true;
+      }
+      await sleep(hidden ? 200 : 120);
+    }
+    if (p.clicked && Date.now() - p.placedAt >= clickTrustMs) {
+      p.verified = true;
+      logConfirmedBet(p);
+      return true;
+    }
+    return false;
+  }
+
+  async function waitForBetVerified(stake, balBefore, timeoutMs) {
     const hidden = document.hidden || document.visibilityState !== "visible";
     const deadline = Date.now() + (timeoutMs || (hidden ? 9000 : 3500));
     let uiHits = 0;
     while (Date.now() < deadline) {
       if (isMainPlacedBet()) uiHits += 1;
-      if (balBefore != null && !hidden) {
-        const bal = readBalance();
-        if (bal != null && bal <= balBefore - want * 0.95 + 1e-6) {
-          if (uiHits > 0 || isMainPlacedBet()) return { ok: true, balance: bal, via: "balance" };
-        }
-      } else if (uiHits >= (hidden ? 3 : 2)) {
+      if (balBefore != null && balanceDropped(balBefore, stake)) {
+        return { ok: true, via: "balance" };
+      }
+      if (uiHits >= (hidden ? 2 : 2)) {
         return { ok: true, via: "ui" };
       }
       await sleep(hidden ? 200 : 120);
     }
-    if (uiHits >= 2) return { ok: true, via: "ui-late" };
+    if (uiHits >= 1 || balanceDropped(balBefore, stake)) {
+      return { ok: true, via: "ui-late" };
+    }
     return { ok: false, why: "verify-timeout" };
   }
 
@@ -552,9 +609,13 @@
         return;
       }
       if (!p.verified) {
-        dropPendingBet(`banner gap ${expected}→${id} before verify`);
-        observeRound(value, id);
-        return;
+        if (!p.clicked) {
+          dropPendingBet(`banner gap ${expected}→${id} before verify`);
+          observeRound(value, id);
+          return;
+        }
+        p.verified = true;
+        if (!p.loggedBet) logConfirmedBet(p);
       }
       log(`Banner gap ${expected} → ${id} ${value}x — settle #${expected}`, p.strategy || "streak_low");
       const games = collectBannerGames();
@@ -692,6 +753,21 @@
     if (top.length) {
       top.sort((a, b) => b.x - a.x);
       return top[0].v;
+    }
+
+    if (document.hidden || document.visibilityState !== "visible") {
+      const loose = [];
+      for (const el of document.querySelectorAll("div, span, p, b, strong")) {
+        const t = (el.innerText || "").trim();
+        if (!t || t.length > 24) continue;
+        const v = parseMoney(t);
+        if (v == null || v < 0.01) continue;
+        loose.push(v);
+      }
+      if (loose.length) {
+        loose.sort((a, b) => b - a);
+        return loose[0];
+      }
     }
     return null;
   }
@@ -920,38 +996,35 @@
       }
       return;
     }
-    bot.verifying = true;
-    const verified = await waitForBetVerified(nxt.stake, bal, document.hidden ? 9000 : 3500);
-    bot.verifying = false;
-    bot.placing = false;
-    if (!verified.ok) {
-      if (bot.pending === pendingRef) bot.pending = null;
-      if (!bot.lastPlaceFailLog || Date.now() - bot.lastPlaceFailLog > 3000) {
-        bot.lastPlaceFailLog = Date.now();
-        log(`Bet click not confirmed on site${document.hidden ? " (tab hidden)" : ""} — will retry`, strat);
-      }
-      return;
-    }
-    const actual = Number.isFinite(placed.amount) ? round8(placed.amount) : nxt.stake;
     if (bot.pending === pendingRef) {
+      bot.pending.clicked = true;
+      const actual = Number.isFinite(placed.amount) ? round8(placed.amount) : nxt.stake;
       if (!nearStake(actual, nxt.stake)) {
         log(`Stake snapped to ${actual} (wanted ${nxt.stake})`, strat);
       }
       bot.pending.stake = actual;
-      bot.pending.verified = true;
+    }
+    bot.verifying = true;
+    const verified = await waitForBetVerified(nxt.stake, bal, document.hidden ? 9000 : 3500);
+    if (verified.ok && bot.pending === pendingRef) {
+      pendingRef.verified = true;
+    } else if (!verified.ok && bot.pending === pendingRef) {
+      await confirmPendingBet(pendingRef, { waitMs: document.hidden ? 6000 : 2000 });
+    }
+    bot.verifying = false;
+    bot.placing = false;
+    if (bot.pending === pendingRef && !pendingRef.verified) {
+      syncPendingFlag();
+      if (!bot.lastPlaceFailLog || Date.now() - bot.lastPlaceFailLog > 3000) {
+        bot.lastPlaceFailLog = Date.now();
+        log(`Bet sent — confirming on site${document.hidden ? " (screen locked)" : ""}…`, strat);
+      }
+      return;
+    }
+    if (bot.pending === pendingRef && pendingRef.verified && !pendingRef.loggedBet) {
+      logConfirmedBet(pendingRef);
     }
     bot.didPlaceInWindow = true;
-    bot.awaitingBet = false;
-    syncAwaitingFlag();
-    syncPendingFlag();
-    stopPlacePump();
-    log(`Bet ${actual} @ ${nxt.cashout}x confirmed (#${betGameId})`, strat);
-    pushBetLog({
-      kind: "bet",
-      stake: actual,
-      cashout: nxt.cashout,
-      gameId: betGameId,
-    }, strat);
   }
 
   function pendingMinId(p) {
@@ -962,8 +1035,29 @@
     const p = bot.pending;
     if (!p) return;
     if (!p.verified) {
-      dropPendingBet("settle without site verify");
-      return;
+      if (!p.clicked) {
+        dropPendingBet("settle without site verify");
+        return;
+      }
+      if (!p.loggedBet) {
+        if (p.gameId != null && p.gameCrash != null) {
+          p.verified = true;
+          logConfirmedBet(p);
+        } else if (p.betGameId != null) {
+          const games = collectBannerGames();
+          const row = games.find((g) => g.id === p.betGameId);
+          if (!row) return;
+          p.gameId = p.betGameId;
+          p.gameCrash = row.v;
+          p.sawRound = true;
+          p.verified = true;
+          logConfirmedBet(p);
+        } else {
+          return;
+        }
+      } else {
+        p.verified = true;
+      }
     }
     const age = (Date.now() - p.placedAt) / 1000;
     const cash2 = round2(p.cashout);
@@ -1102,6 +1196,9 @@
 
   function onKeepaliveTick() {
     sendGameValueUpdates();
+    if (bot.pending && bot.pending.clicked && !bot.pending.verified) {
+      confirmPendingBet(bot.pending, { waitMs: document.hidden ? 2500 : 800 });
+    }
     if (bot.pending) {
       if (!document.hidden) checkPendingCancelled();
       if (bot.pending) settle();
