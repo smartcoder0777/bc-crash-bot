@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "BC Crash Bot",
-  "version": "1.1.11",
-  "description": "Streak-low and single-green crash strategies. One bet per round, separate logs.",
+  "name": "BC Moon Row Bot",
+  "version": "1.0.0",
+  "description": "Moon Row bet-red crash strategy — trend board moons, martingale red bets.",
   "permissions": ["storage", "activeTab", "scripting", "alarms", "tabs"],
   "host_permissions": [
     "*://*.bc.game/*",
@@ -11,7 +11,7 @@
     "*://bcmail2.com/*"
   ],
   "action": {
-    "default_title": "BC Crash Bot",
+    "default_title": "BC Moon Row Bot",
     "default_popup": "popup.html"
   },
   "background": {
@@ -36,12 +36,7 @@
         "*://*.bcmail2.com/*",
         "*://bcmail2.com/*"
       ],
-      "js": [
-        "strategy.js",
-        "strategy-single-green.js",
-        "config.js",
-        "content.js"
-      ],
+      "js": ["strategy-moon-row.js", "content.js"],
       "css": ["overlay.css"],
       "run_at": "document_idle"
     }

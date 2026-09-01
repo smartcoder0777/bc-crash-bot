@@ -128,25 +128,27 @@
     }
 
     /** Set SG state from banner history (same rules as dashboard batch walk). */
-    initFromBanner(games) {
-      const st = defaultSingleGreenState();
+    /** Recompute armed / sg_count from game tail (batch rules — past greens do not re-arm a bet). */
+    _applyBatchWalk(rows) {
+      const st = this.state;
       const green = Number(this.config.green) || 2;
       const need = Number(this.config.single_greens_required) || 3;
-      const rows = (games || [])
-        .map((g) => ({ id: Number(g.id), value: round2(g.value) }))
+      const sorted = (rows || [])
+        .map((g) => ({ id: Number(g.id), value: round2(g.value != null ? g.value : g.v) }))
         .filter((g) => Number.isFinite(g.id) && g.id > 0 && g.value > 0)
-        .sort((a, b) => a.id - b.id);
+        .sort((a, b) => a.id - b.id)
+        .slice(-40);
 
-      st.games = rows.slice(-40);
+      st.games = sorted;
 
       let c = 0;
       let armed = false;
-      for (let i = 1; i < rows.length - 1; i++) {
-        if (rows[i].value >= green) {
+      for (let i = 1; i < sorted.length - 1; i++) {
+        if (sorted[i].value >= green) {
           if (armed) {
             armed = false;
             c = 0;
-          } else if (isSingleGreen(rows, i, green)) {
+          } else if (isSingleGreen(sorted, i, green)) {
             c += 1;
             if (c >= need) {
               armed = true;
@@ -161,7 +163,12 @@
       st.sg_count = c;
       st.armed = armed;
       st.awaiting_bet = false;
+    }
+
+    initFromBanner(games) {
+      const st = defaultSingleGreenState();
       this.state = st;
+      this._applyBatchWalk(games);
       this._syncMessage();
     }
 
@@ -183,7 +190,18 @@
     }
 
     onMissedBet() {
+      this.onBetAborted("missed round");
+    }
+
+    /** Bet window closed without a placed bet — full reset, count SGs again. */
+    onBetAborted(reason) {
       this.state.awaiting_bet = false;
+      this.state.armed = false;
+      this.state.sg_count = 0;
+      const r = reason ? String(reason) : "";
+      this.state.message = r
+        ? `Bet aborted (${r}) — counting single greens again`
+        : "Counting single greens again";
       this._syncMessage();
     }
 
@@ -235,14 +253,11 @@
       if (!opts || !opts.replay) this._syncMessage();
     }
 
-    onBetResult(won, stake, crashAt) {
+    onBetResult(won, stake, crashAt, gameId, allGames) {
       const cfg = this.config;
       const st = this.state;
       st.bets_placed += 1;
       st.last_crash = crashAt ?? null;
-      st.awaiting_bet = false;
-      st.armed = false;
-      st.sg_count = 0;
 
       if (won) {
         const profit = stake * (cfg.cashout - 1);
@@ -270,6 +285,16 @@
         });
         st.message = `Lose −${stake} — counting single greens again`;
       }
+
+      let rows = Array.isArray(allGames) ? allGames : st.games.slice();
+      const gid = Number(gameId);
+      if (Number.isFinite(gid) && gid > 0 && crashAt != null) {
+        const row = { id: gid, value: round2(crashAt) };
+        const last = rows[rows.length - 1];
+        if (!last || last.id < row.id) rows.push(row);
+        else if (last.id === row.id) rows[rows.length - 1] = row;
+      }
+      this._applyBatchWalk(rows);
 
       if (this._hitStopLoss()) this._stop("Stop-loss reached");
       else this._syncMessage();

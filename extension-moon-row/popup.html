@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>BC Moon Row Bot</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <h1>Moon Row Bot <span id="extVer" class="ver"></span></h1>
+  <p id="pageHint" class="hint">Bet red after valid moon positions. Do not run other BC bots on the same tab.</p>
+
+  <div class="tabs" role="tablist">
+    <button type="button" class="tab active" data-tab="bot" id="tabBot">Bot</button>
+    <button type="button" class="tab" data-tab="log" id="tabLog">Log</button>
+  </div>
+
+  <section id="panelBot" class="tab-panel">
+    <div class="stats">
+      <div><span>Betting</span><b id="betting">off</b></div>
+      <div><span>Row</span><b id="rowStat">—</b></div>
+      <div><span>Sequence</span><b id="seqStat">—</b></div>
+      <div><span>Stake</span><b id="stake">—</b></div>
+      <div><span>P/L</span><b id="pnl">0</b></div>
+      <div><span>W / L</span><b id="wl">0 / 0</b></div>
+      <div><span>Seq W/L</span><b id="seqWl">0 / 0</b></div>
+      <div><span>Balance</span><b id="bal">—</b></div>
+    </div>
+    <p id="msg" class="msg">—</p>
+
+    <div class="actions">
+      <button type="button" id="btnStart" class="on">Start</button>
+      <button type="button" id="btnStop" class="off">Stop</button>
+      <button type="button" id="btnReset">Reset</button>
+    </div>
+
+    <form id="cfg">
+      <div class="form-title">Moon Row settings</div>
+      <label>Base stake <input name="stake" type="number" step="any" /></label>
+      <label>Red cashout <input name="cashout" type="number" step="any" /></label>
+      <label>Martingale × <input name="martingale" type="number" step="any" /></label>
+      <label>Max attempts <input name="max_attempts" type="number" step="1" min="1" max="5" /></label>
+      <label>Moon min <input name="moon_min" type="number" step="any" /></label>
+      <label>Cat min <input name="cat_min" type="number" step="any" /></label>
+      <label>Pos2 if 1st &lt; <input name="pos2_max_first" type="number" step="any" /></label>
+      <label>Filter rows <input name="filter_rows" type="number" step="1" min="1" max="20" /></label>
+      <label>Stop loss <input name="stop_loss" type="number" step="any" /></label>
+      <button type="submit" class="on">Save settings</button>
+    </form>
+  </section>
+
+  <section id="panelLog" class="tab-panel hidden">
+    <div class="log-totals">
+      <div><span>Won</span><b id="logWon" class="win">0</b></div>
+      <div><span>Lost</span><b id="logLost" class="lose">0</b></div>
+      <div><span>P/L</span><b id="logPnl">0</b></div>
+    </div>
+    <div class="log-head">
+      <span>Time</span>
+      <span>Type</span>
+      <span>Bet</span>
+      <span>Amount</span>
+      <span>Round</span>
+    </div>
+    <div id="logList" class="log-list">
+      <div class="log-empty">No bets yet.</div>
+    </div>
+    <p class="hint log-hint">RED = crash below cashout (~1.96×). Log shows actual crash multiplier.</p>
+  </section>
+
+  <p class="hint">Reload extension after updates. Refresh crash tab before Start.</p>
+  <script src="popup.js"></script>
+</body>
+</html>

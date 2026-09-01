@@ -1,4 +1,4 @@
-const KEEPALIVE_ALARM = "bc4low-keepalive";
+const KEEPALIVE_ALARM = "bcmoon-keepalive";
 const TICK_MS = 4000;
 const TICK_ARMED_MS = 500;
 const TICK_PENDING_MS = 350;
@@ -10,12 +10,7 @@ const CRASH_URLS = [
   "*://bcmail2.com/*",
 ];
 
-const INJECT_FILES = [
-  "strategy.js",
-  "strategy-single-green.js",
-  "config.js",
-  "content.js",
-];
+const INJECT_FILES = ["strategy-moon-row.js", "content.js"];
 
 function scheduleKeepalive(ms) {
   chrome.alarms.clear(KEEPALIVE_ALARM, () => {
@@ -44,15 +39,7 @@ async function ensureInject(tabId) {
       files: ["inject.js"],
       world: "MAIN",
     });
-  } catch (_) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ["inject.js"],
-        world: "MAIN",
-      });
-    } catch (_) {}
-  }
+  } catch (_) {}
 }
 
 async function ensureContent(tabId) {
@@ -61,61 +48,33 @@ async function ensureContent(tabId) {
       target: { tabId, allFrames: true },
       files: INJECT_FILES,
     });
-    try {
-      await chrome.scripting.insertCSS({
-        target: { tabId, allFrames: true },
-        files: ["overlay.css"],
-      });
-    } catch (_) {}
+    await chrome.scripting.insertCSS({
+      target: { tabId, allFrames: true },
+      files: ["overlay.css"],
+    });
     return true;
   } catch (_) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: INJECT_FILES,
-      });
-      return true;
-    } catch (_) {
-      return false;
-    }
+    return false;
   }
-}
-
-async function wakeTab(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: () => {
-        try {
-          window.postMessage({ source: "bc-crash-4low", type: "wake" }, "*");
-        } catch (_) {}
-      },
-    });
-  } catch (_) {}
 }
 
 async function pingCrashTabs(data) {
   const tabs = await crashTabs();
-  const armed = !!(data && data.awaiting_bet);
-  const pending = !!(data && data.pending_bet);
   for (const tab of tabs) {
     if (data && data.betting_enabled) {
       await setTabUndiscardable(tab.id, true);
       await ensureInject(tab.id);
     }
-    await wakeTab(tab.id);
-    let ok = false;
     try {
-      await chrome.tabs.sendMessage(tab.id, { type: "KEEPALIVE_TICK", armed, pending });
-      ok = true;
-    } catch (_) {}
-    if (!ok && data && data.betting_enabled) {
-      await ensureContent(tab.id);
-      await ensureInject(tab.id);
-      try {
-        await chrome.tabs.sendMessage(tab.id, { type: "KEEPALIVE_TICK", armed, pending });
-      } catch (_) {}
+      await chrome.tabs.sendMessage(tab.id, { type: "KEEPALIVE_TICK" });
+    } catch (_) {
+      if (data && data.betting_enabled) {
+        await ensureContent(tab.id);
+        await ensureInject(tab.id);
+        try {
+          await chrome.tabs.sendMessage(tab.id, { type: "KEEPALIVE_TICK" });
+        } catch (_) {}
+      }
     }
   }
 }
@@ -125,23 +84,15 @@ chrome.runtime.onInstalled.addListener(() => {
     if (!data.config) {
       chrome.storage.local.set({
         config: {
-          enabled_streak_low: true,
-          enabled_single_green: false,
-          streak_low: {
-            stake: 100,
-            cashout: 1.9,
-            low_below: 1.45,
-            streak_needed: 4,
-            skip_on_lose: 6,
-            stop_loss: 500,
-          },
-          single_green: {
-            stake: 100,
-            cashout: 2,
-            green: 2,
-            single_greens_required: 3,
-            stop_loss: 500,
-          },
+          stake: 100,
+          cashout: 1.96,
+          martingale: 2,
+          max_attempts: 3,
+          moon_min: 10,
+          cat_min: 100,
+          pos2_max_first: 4,
+          filter_rows: 10,
+          stop_loss: 500,
         },
         betting_enabled: false,
         awaiting_bet: false,

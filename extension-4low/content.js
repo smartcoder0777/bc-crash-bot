@@ -33,6 +33,10 @@
     armedAtId: 0,
     placePump: null,
     verifying: null,
+    injectReady: false,
+    injectHasApi: false,
+    apiPlaceSeq: 0,
+    wsPhase: "unknown",
   };
 
   let extVersion = "1.1.3";
@@ -54,6 +58,7 @@
     if (bot.dead) return;
     bot.dead = true;
     bot.betting = false;
+    stopAudioKeepalive();
     syncBettingFlag();
     if (tickTimer) {
       clearInterval(tickTimer);
@@ -177,6 +182,7 @@
     bot.armedAtId = 0;
     stopPlacePump();
     syncPendingFlag();
+    if (strat === "single_green") sgEngine.onBetAborted(reason);
     log(`Bet removed from log (${reason})`, strat);
   }
 
@@ -279,11 +285,44 @@
     return ranked[0] || null;
   }
 
+  let audioKeepalive = null;
+
+  function startAudioKeepalive() {
+    if (audioKeepalive) return;
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      gain.gain.value = 0.0001;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      const resume = () => {
+        if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      };
+      resume();
+      document.addEventListener("visibilitychange", resume);
+      audioKeepalive = { ctx, osc, gain, resume };
+    } catch (_) {}
+  }
+
+  function stopAudioKeepalive() {
+    if (!audioKeepalive) return;
+    try {
+      document.removeEventListener("visibilitychange", audioKeepalive.resume);
+      audioKeepalive.osc.stop();
+      audioKeepalive.ctx.close();
+    } catch (_) {}
+    audioKeepalive = null;
+  }
+
   function syncBettingFlag() {
     try {
       chrome.storage.local.set({ betting_enabled: !!bot.betting });
       chrome.runtime.sendMessage({ type: bot.betting ? "BETTING_ON" : "BETTING_OFF" });
     } catch (_) {}
+    if (bot.betting) startAudioKeepalive();
+    else stopAudioKeepalive();
   }
 
   function syncAwaitingFlag() {
@@ -298,7 +337,7 @@
       const on = !!(
         bot.pending &&
         !bot.pending.sawRound &&
-        (bot.pending.verified || bot.pending.clicked)
+        (bot.pending.verified || bot.pending.clicked || bot.pending.apiOk)
       );
       chrome.storage.local.set({ pending_bet: on });
       if (on) chrome.runtime.sendMessage({ type: "PENDING_BET", value: true });
@@ -353,42 +392,42 @@
     if (!p || p.verified) return true;
     const waitMs = (opts && opts.waitMs) || 2000;
     const hidden = document.hidden || document.visibilityState !== "visible";
-    const clickTrustMs = hidden ? 1200 : 2800;
     const deadline = Date.now() + waitMs;
     while (Date.now() < deadline) {
-      if (isMainPlacedBet() || balanceDropped(p.balAtPlace, p.stake)) {
-        p.verified = true;
-        logConfirmedBet(p);
-        return true;
-      }
-      if (p.clicked && Date.now() - p.placedAt >= clickTrustMs) {
+      if (
+        p.apiOk ||
+        p.wsAck ||
+        isMainPlacedBet() ||
+        balanceDropped(p.balAtPlace, p.stake)
+      ) {
         p.verified = true;
         logConfirmedBet(p);
         return true;
       }
       await sleep(hidden ? 200 : 120);
-    }
-    if (p.clicked && Date.now() - p.placedAt >= clickTrustMs) {
-      p.verified = true;
-      logConfirmedBet(p);
-      return true;
     }
     return false;
   }
 
-  async function waitForBetVerified(stake, balBefore, timeoutMs) {
+  async function waitForBetVerified(stake, balBefore, timeoutMs, pendingRef) {
     const hidden = document.hidden || document.visibilityState !== "visible";
-    const deadline = Date.now() + (timeoutMs || (hidden ? 9000 : 3500));
+    const deadline = Date.now() + (timeoutMs || (hidden ? 12000 : 3500));
     let uiHits = 0;
     while (Date.now() < deadline) {
+      if (pendingRef && (pendingRef.apiOk || pendingRef.wsAck)) {
+        return { ok: true, via: pendingRef.apiOk ? "api" : "ws" };
+      }
       if (isMainPlacedBet()) uiHits += 1;
       if (balBefore != null && balanceDropped(balBefore, stake)) {
         return { ok: true, via: "balance" };
       }
-      if (uiHits >= (hidden ? 2 : 2)) {
+      if (uiHits >= 2) {
         return { ok: true, via: "ui" };
       }
       await sleep(hidden ? 200 : 120);
+    }
+    if (pendingRef && (pendingRef.apiOk || pendingRef.wsAck)) {
+      return { ok: true, via: "api-late" };
     }
     if (uiHits >= 1 || balanceDropped(balBefore, stake)) {
       return { ok: true, via: "ui-late" };
@@ -594,6 +633,37 @@
     return games.sort((a, b) => a.id - b.id);
   }
 
+  function pendingWasPlaced(p) {
+    if (!p) return false;
+    if (p.verified || p.apiOk || p.wsAck || p.loggedBet) return true;
+    if (p.clicked && (isMainPlacedBet() || balanceDropped(p.balAtPlace, p.stake))) return true;
+    return false;
+  }
+
+  function abortStrategyBet(strategy, reason) {
+    bot.awaitingBet = false;
+    bot.armedStrategy = null;
+    bot.armedAtId = 0;
+    stopPlacePump();
+    syncAwaitingFlag();
+    if (strategy === "single_green") sgEngine.onBetAborted(reason);
+  }
+
+  function observeEnginesAfterRound(value, id, skipSg) {
+    if (isEnabled("streak_low")) {
+      streakEngine.onRoundObserved(value);
+      log(streakEngine.state.message, "streak_low");
+    }
+    if (isEnabled("single_green") && !skipSg) {
+      sgEngine.onRoundObserved(value, id);
+      log(sgEngine.state.message, "single_green");
+    }
+    const intent = pickBetIntent();
+    if (intent) {
+      bot.armedStrategy = intent.key;
+      armBet(id || bot.lastGameId, intent.key);
+    }
+  }
   function onNewBannerGame(id, value) {
     bot.lastGameItem = { id, crash: value, ts: Date.now() };
     const p = bot.pending;
@@ -605,17 +675,27 @@
         p.gameCrash = value;
         p.sawRound = true;
         bot.awaitingBet = false;
+        if (!pendingWasPlaced(p)) {
+          const strat = p.strategy || "streak_low";
+          bot.pending = null;
+          stopPlacePump();
+          syncPendingFlag();
+          if (strat === "single_green") {
+            abortStrategyBet("single_green", "round ended without bet");
+            observeEnginesAfterRound(value, id);
+          } else {
+            dropPendingBet("round ended without bet");
+            observeRound(value, id);
+          }
+          return;
+        }
         settle();
         return;
       }
-      if (!p.verified) {
-        if (!p.clicked) {
-          dropPendingBet(`banner gap ${expected}→${id} before verify`);
-          observeRound(value, id);
-          return;
-        }
-        p.verified = true;
-        if (!p.loggedBet) logConfirmedBet(p);
+      if (!p.verified && !pendingWasPlaced(p)) {
+        dropPendingBet(`banner gap ${expected}→${id} before verify`);
+        observeRound(value, id);
+        return;
       }
       log(`Banner gap ${expected} → ${id} ${value}x — settle #${expected}`, p.strategy || "streak_low");
       const games = collectBannerGames();
@@ -803,6 +883,9 @@
   }
 
   function betButtonReady() {
+    if ((document.hidden || document.visibilityState !== "visible") && bot.wsPhase === "betting") {
+      return true;
+    }
     return !!findMainBetButton();
   }
 
@@ -835,19 +918,112 @@
   }
 
   function clickEl(el) {
+    if (!el) return;
+    try {
+      el.focus();
+    } catch (_) {}
+    try {
+      const rect = el.getBoundingClientRect();
+      const x = (rect.width || 8) / 2 + (rect.left || 0);
+      const y = (rect.height || 8) / 2 + (rect.top || 0);
+      const opts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: x,
+        clientY: y,
+        buttons: 1,
+      };
+      if (typeof PointerEvent === "function") {
+        el.dispatchEvent(new PointerEvent("pointerdown", { ...opts, pointerId: 1, pointerType: "mouse" }));
+        el.dispatchEvent(new PointerEvent("pointerup", { ...opts, pointerId: 1, pointerType: "mouse" }));
+      }
+      el.dispatchEvent(new MouseEvent("mousedown", opts));
+      el.dispatchEvent(new MouseEvent("mouseup", opts));
+      el.dispatchEvent(new MouseEvent("click", opts));
+    } catch (_) {}
     try {
       el.click();
     } catch (_) {}
   }
 
+  const INJECT_SRC = "bc-crash-4low";
+
+  function placeBetViaApi(stake, cashout, timeoutMs) {
+    return new Promise((resolve) => {
+      const id = ++bot.apiPlaceSeq;
+      let done = false;
+      const finish = (result) => {
+        if (done) return;
+        done = true;
+        window.removeEventListener("message", onMsg);
+        clearTimeout(timer);
+        resolve(result || { ok: false, why: "no-response" });
+      };
+      const onMsg = (ev) => {
+        const d = ev.data;
+        if (!d || d.source !== INJECT_SRC || d.type !== "PLACE_RESULT" || d.id !== id) return;
+        finish(d.result);
+      };
+      const timer = setTimeout(() => finish({ ok: false, why: "api-timeout" }), timeoutMs || 4000);
+      window.addEventListener("message", onMsg);
+      try {
+        window.postMessage(
+          { source: INJECT_SRC, type: "PLACE_BET", id, stake, cashout },
+          "*"
+        );
+      } catch (err) {
+        finish({ ok: false, why: String(err) });
+      }
+    });
+  }
+
+  function onInjectMessage(ev) {
+    const d = ev.data;
+    if (!d || d.source !== INJECT_SRC) return;
+    if (d.type === "inject_ready") {
+      bot.injectReady = true;
+      bot.injectHasApi = !!(d.hasApi || d.hasTemplate);
+      return;
+    }
+    if (d.type === "heartbeat") {
+      bot.injectReady = true;
+      bot.injectHasApi = !!(d.hasApi || d.hasTemplate);
+      if (d.phase) bot.wsPhase = d.phase;
+      return;
+    }
+    if (d.type === "phase" && d.phase) {
+      bot.wsPhase = d.phase;
+      return;
+    }
+    if (d.type === "ws_bet_ack" && bot.pending) {
+      bot.pending.wsAck = true;
+      return;
+    }
+    if (d.type === "game_item" && d.id && d.crash) {
+      onNewBannerGame(Number(d.id), Number(d.crash));
+      return;
+    }
+    if (d.type === "wake" && bot.betting) {
+      onKeepaliveTick();
+    }
+  }
+
   function mainAmountInput(btn) {
-    const limit = sideBetLeft();
+    const hidden = document.hidden || document.visibilityState !== "visible";
+    if (hidden) {
+      const labeled = inputNearLabel(/amount|bet/i);
+      if (labeled && isFillableInput(labeled)) return labeled;
+    }
+    const limit = hidden ? Infinity : sideBetLeft();
     const br = btn.getBoundingClientRect();
     const cands = [...document.querySelectorAll("input")].filter(isFillableInput).filter((el) => {
+      if (hidden) return true;
       const r = el.getBoundingClientRect();
       return r.left < limit && r.left < br.right + 24;
     });
     if (!cands.length) return null;
+    if (hidden) return cands[0];
     cands.sort((a, b) => {
       const da = Math.abs(a.getBoundingClientRect().top - br.bottom);
       const db = Math.abs(b.getBoundingClientRect().top - br.bottom);
@@ -879,7 +1055,7 @@
     return amount ? [amount] : [];
   }
 
-  function placeBet(stake, cashout) {
+  function placeBetDom(stake, cashout) {
     dismissCookies();
     clickManualTab();
     const btn = findMainBetButton();
@@ -892,7 +1068,23 @@
     const confirmed = fillStake(amount, stake);
     if (!confirmed.ok) return confirmed;
     clickEl(btn);
-    return { ok: true, label: normText(btn), amount: confirmed.amount, snapped: !!confirmed.snapped };
+    return { ok: true, via: "dom", label: normText(btn), amount: confirmed.amount, snapped: !!confirmed.snapped };
+  }
+
+  async function placeBet(stake, cashout) {
+    const hidden = document.hidden || document.visibilityState !== "visible";
+    if (bot.injectReady || hidden) {
+      const api = await placeBetViaApi(stake, cashout, hidden ? 5000 : 2500);
+      if (api.ok) {
+        return {
+          ok: true,
+          via: api.via || "api",
+          amount: stake,
+          apiConfirmed: api.via === "handleBetCrash",
+        };
+      }
+    }
+    return placeBetDom(stake, cashout);
   }
 
   function canPlace() {
@@ -984,11 +1176,11 @@
       sawRound: false,
     };
     const pendingRef = bot.pending;
-    const placed = placeBet(nxt.stake, nxt.cashout);
+    const placed = await placeBet(nxt.stake, nxt.cashout);
     if (!placed.ok) {
       bot.placing = false;
       if (bot.pending === pendingRef) bot.pending = null;
-      const soft = placed.why === "no-bet-button" || placed.why === "no-enabled-input";
+      const soft = placed.why === "no-bet-button" || placed.why === "no-enabled-input" || placed.why === "no-api";
       if (!soft) bot.lastPlaceFail = Date.now();
       if (!bot.lastPlaceFailLog || Date.now() - bot.lastPlaceFailLog > 2000) {
         bot.lastPlaceFailLog = Date.now();
@@ -997,7 +1189,8 @@
       return;
     }
     if (bot.pending === pendingRef) {
-      bot.pending.clicked = true;
+      bot.pending.clicked = placed.via === "dom";
+      bot.pending.apiOk = !!placed.apiConfirmed;
       const actual = Number.isFinite(placed.amount) ? round8(placed.amount) : nxt.stake;
       if (!nearStake(actual, nxt.stake)) {
         log(`Stake snapped to ${actual} (wanted ${nxt.stake})`, strat);
@@ -1005,7 +1198,12 @@
       bot.pending.stake = actual;
     }
     bot.verifying = true;
-    const verified = await waitForBetVerified(nxt.stake, bal, document.hidden ? 9000 : 3500);
+    const verified = await waitForBetVerified(
+      nxt.stake,
+      bal,
+      document.hidden ? 12000 : 3500,
+      pendingRef
+    );
     if (verified.ok && bot.pending === pendingRef) {
       pendingRef.verified = true;
     } else if (!verified.ok && bot.pending === pendingRef) {
@@ -1015,9 +1213,20 @@
     bot.placing = false;
     if (bot.pending === pendingRef && !pendingRef.verified) {
       syncPendingFlag();
+      const stale = Date.now() - pendingRef.placedAt > 90000;
+      if (stale) {
+        log(`Bet never confirmed — clearing and will retry`, strat);
+        bot.pending = null;
+        bot.placing = false;
+        syncPendingFlag();
+        return;
+      }
       if (!bot.lastPlaceFailLog || Date.now() - bot.lastPlaceFailLog > 3000) {
         bot.lastPlaceFailLog = Date.now();
-        log(`Bet sent — confirming on site${document.hidden ? " (screen locked)" : ""}…`, strat);
+        log(
+          `Bet not confirmed on site${document.hidden ? " (screen locked — keep tab open)" : ""} — retrying…`,
+          strat
+        );
       }
       return;
     }
@@ -1035,18 +1244,22 @@
     const p = bot.pending;
     if (!p) return;
     if (!p.verified) {
-      if (!p.clicked) {
-        dropPendingBet("settle without site verify");
-        return;
-      }
-      if (!p.loggedBet) {
-        if (p.gameId != null && p.gameCrash != null) {
-          p.verified = true;
-          logConfirmedBet(p);
+      if (p.apiOk || p.wsAck) {
+        p.verified = true;
+        if (!p.loggedBet) logConfirmedBet(p);
+      } else if (p.clicked) {
+        if (!p.loggedBet && p.gameId != null && p.gameCrash != null) {
+          if (isMainPlacedBet() || balanceDropped(p.balAtPlace, p.stake)) {
+            p.verified = true;
+            logConfirmedBet(p);
+          } else {
+            return;
+          }
         } else if (p.betGameId != null) {
           const games = collectBannerGames();
           const row = games.find((g) => g.id === p.betGameId);
           if (!row) return;
+          if (!(isMainPlacedBet() || balanceDropped(p.balAtPlace, p.stake) || p.wsAck)) return;
           p.gameId = p.betGameId;
           p.gameCrash = row.v;
           p.sawRound = true;
@@ -1056,7 +1269,8 @@
           return;
         }
       } else {
-        p.verified = true;
+        dropPendingBet("settle without site verify");
+        return;
       }
     }
     const age = (Date.now() - p.placedAt) / 1000;
@@ -1078,7 +1292,8 @@
     const strat = p.strategy || "streak_low";
     const eng = engineFor(strat);
     const source = `${crashId || "?"} ${crash2}x ${won ? ">=" : "<"} ${cash2}x`;
-    eng.onBetResult(won, p.stake, crash);
+    const bannerGames = collectBannerGames().map((g) => ({ id: g.id, value: g.v }));
+    eng.onBetResult(won, p.stake, crash, crashId, strat === "single_green" ? bannerGames : null);
     log(`${won ? "Win" : "Lose"} (${source}) | ${eng.state.message}`, strat);
     const last = eng.state.history[eng.state.history.length - 1];
     pushBetLog(
@@ -1134,6 +1349,16 @@
     if (bot.awaitingBet && !bot.pending && !bot.verifying) {
       handleMissedRound(value, id);
       return;
+    }
+    if (
+      isEnabled("single_green") &&
+      sgEngine.state.awaiting_bet &&
+      !bot.awaitingBet &&
+      !bot.pending &&
+      !bot.verifying
+    ) {
+      sgEngine.onBetAborted("out of sync");
+      log(sgEngine.state.message, "single_green");
     }
     if (isEnabled("streak_low") && streakEngine.state.mode === Mode.SKIPPING) {
       streakEngine.onRoundObserved(value);
@@ -1194,10 +1419,51 @@
     });
   }
 
+  function clearUnverifiedPending(reason) {
+    const p = bot.pending;
+    if (!p || p.verified || p.loggedBet) return;
+    const strat = p.strategy || "streak_low";
+    const expected = pendingMinId(p) + 1;
+    const games = collectBannerGames();
+    const roundPassed = games.some((g) => g.id >= expected);
+
+    bot.pending = null;
+    bot.verifying = false;
+    bot.placing = false;
+    syncPendingFlag();
+
+    if (strat === "single_green" && roundPassed) {
+      abortStrategyBet("single_green", reason);
+      const row = games.find((g) => g.id === expected) || games[games.length - 1];
+      if (row) observeEnginesAfterRound(row.v, row.id);
+      return;
+    }
+
+    if (strat === "single_green") {
+      log(`Bet not confirmed (${reason}) — retrying this round`, strat);
+      return;
+    }
+
+    bot.awaitingBet = false;
+    bot.armedStrategy = null;
+    stopPlacePump();
+    log(`Pending bet cleared (${reason})`, strat);
+  }
+
   function onKeepaliveTick() {
     sendGameValueUpdates();
-    if (bot.pending && bot.pending.clicked && !bot.pending.verified) {
-      confirmPendingBet(bot.pending, { waitMs: document.hidden ? 2500 : 800 });
+    if (bot.pending && !bot.pending.verified) {
+      const age = Date.now() - bot.pending.placedAt;
+      const placed =
+        bot.pending.apiOk ||
+        bot.pending.wsAck ||
+        isMainPlacedBet() ||
+        balanceDropped(bot.pending.balAtPlace, bot.pending.stake);
+      if (age > 12000 && !placed) {
+        clearUnverifiedPending("not confirmed on site");
+      } else {
+        confirmPendingBet(bot.pending, { waitMs: document.hidden ? 4000 : 800 });
+      }
     }
     if (bot.pending) {
       if (!document.hidden) checkPendingCancelled();
@@ -1347,6 +1613,7 @@
         return;
       }
       if (msg.type === "KEEPALIVE_TICK") {
+        if (msg.armed || msg.pending) bot.placeAfter = 0;
         onKeepaliveTick();
         sendResponse({ ok: true });
         return;
@@ -1442,6 +1709,8 @@
         startLiveUpdates();
       });
     });
+
+    window.addEventListener("message", onInjectMessage);
 
     tickTimer = setInterval(tick, 120);
     window.__bcCrash4LowLoaded = true;
